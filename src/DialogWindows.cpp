@@ -1,0 +1,938 @@
+#include "DialogWindows.h"
+
+#include "UiRenderer.h"
+
+#include <dwmapi.h>
+#include <gdiplus.h>
+#include <windowsx.h>
+
+#include <algorithm>
+#include <array>
+#include <cstring>
+#include <string>
+
+namespace {
+
+constexpr const wchar_t* kDialogClassName = L"YoutubeDownloaderDialogWindow";
+constexpr const wchar_t* kDialogButtonClassName = L"YoutubeDownloaderDialogButton";
+constexpr const wchar_t* kScrollTextClassName = L"YoutubeDownloaderScrollText";
+
+constexpr COLORREF kBackgroundColor = RGB(20, 20, 22);
+constexpr COLORREF kPanelColor = RGB(28, 28, 31);
+constexpr COLORREF kTextColor = RGB(242, 242, 242);
+constexpr COLORREF kMutedTextColor = RGB(172, 172, 178);
+constexpr int kDialogPanelInset = 12;
+constexpr int kDialogButtonInset = 16;
+constexpr int kDialogButtonGap = 12;
+constexpr int kDialogButtonHeight = 34;
+constexpr int kScrollTextTopPadding = 12;
+constexpr int kScrollTextBottomPadding = 12;
+constexpr int kScrollTextClipTopPadding = 8;
+constexpr int kScrollTextClipBottomPadding = 8;
+
+enum class DialogType {
+    Info,
+    Error,
+    Settings,
+    About,
+    Ffmpeg
+};
+
+enum DialogCommand {
+    IdOk = 1,
+    IdCancel = 2,
+    IdCopy = 10,
+    IdAbout = 11,
+    IdFfmpeg = 12,
+    IdInstall = 13,
+    IdChoose = 14,
+    IdSkip = 15
+};
+
+struct ButtonState {
+    int commandId = 0;
+    bool primary = false;
+    bool hot = false;
+    bool pressed = false;
+    std::wstring text;
+};
+
+struct ScrollTextState {
+    std::wstring text;
+    int scrollY = 0;
+    int contentHeight = 0;
+    bool draggingThumb = false;
+    int dragStartY = 0;
+    int dragStartScrollY = 0;
+};
+
+struct DialogState {
+    DialogType type = DialogType::Info;
+    HINSTANCE instance = nullptr;
+    HWND owner = nullptr;
+    HWND window = nullptr;
+    HWND scrollText = nullptr;
+    std::wstring title;
+    std::wstring message;
+};
+
+void EnableDarkTitleBar(HWND window) {
+    BOOL enabled = TRUE;
+    constexpr DWORD kDwmUseImmersiveDarkMode = 20;
+    if (FAILED(DwmSetWindowAttribute(window, kDwmUseImmersiveDarkMode, &enabled, sizeof(enabled)))) {
+        constexpr DWORD kDwmUseImmersiveDarkModeBefore20H1 = 19;
+        DwmSetWindowAttribute(window, kDwmUseImmersiveDarkModeBefore20H1, &enabled, sizeof(enabled));
+    }
+}
+
+HFONT CreateUiFont(int height = -16, int weight = FW_NORMAL) {
+    LOGFONTW font = {};
+    font.lfHeight = height;
+    font.lfWeight = weight;
+    wcscpy_s(font.lfFaceName, L"Segoe UI");
+    return CreateFontIndirectW(&font);
+}
+
+void DrawTextBlock(HDC dc, const std::wstring& text, RECT rect, COLORREF color, HFONT font, UINT format) {
+    HFONT oldFont = reinterpret_cast<HFONT>(SelectObject(dc, font));
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, color);
+    DrawTextW(dc, text.c_str(), -1, &rect, format | DT_NOPREFIX);
+    SelectObject(dc, oldFont);
+}
+
+void CopyToClipboard(HWND owner, const std::wstring& text) {
+    if (!OpenClipboard(owner)) {
+        return;
+    }
+    EmptyClipboard();
+    const SIZE_T byteCount = (text.size() + 1) * sizeof(wchar_t);
+    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, byteCount);
+    if (memory) {
+        void* target = GlobalLock(memory);
+        if (target) {
+            memcpy(target, text.c_str(), byteCount);
+            GlobalUnlock(memory);
+            SetClipboardData(CF_UNICODETEXT, memory);
+            memory = nullptr;
+        }
+    }
+    if (memory) {
+        GlobalFree(memory);
+    }
+    CloseClipboard();
+}
+
+void RegisterDialogClasses(HINSTANCE instance);
+LRESULT CALLBACK DialogWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
+LRESULT CALLBACK DialogButtonProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
+LRESULT CALLBACK ScrollTextProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
+
+HWND CreateDarkButton(HWND parent, HINSTANCE instance, const wchar_t* text, int id, bool primary) {
+    auto* state = new ButtonState{};
+    state->commandId = id;
+    state->primary = primary;
+    state->text = text;
+
+    HWND button = CreateWindowExW(
+        0,
+        kDialogButtonClassName,
+        text,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        0,
+        0,
+        10,
+        10,
+        parent,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+        instance,
+        state
+    );
+    if (!button) {
+        delete state;
+    }
+    return button;
+}
+
+HWND CreateScrollText(HWND parent, HINSTANCE instance, const std::wstring& text) {
+    auto* state = new ScrollTextState{};
+    state->text = text;
+
+    HWND view = CreateWindowExW(
+        0,
+        kScrollTextClassName,
+        L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        0,
+        0,
+        10,
+        10,
+        parent,
+        nullptr,
+        instance,
+        state
+    );
+    if (!view) {
+        delete state;
+    }
+    return view;
+}
+
+void CenterWindow(HWND window, HWND owner, int width, int height) {
+    RECT ownerRect = {};
+    if (owner && IsWindow(owner)) {
+        GetWindowRect(owner, &ownerRect);
+    } else {
+        ownerRect = {
+            0,
+            0,
+            GetSystemMetrics(SM_CXSCREEN),
+            GetSystemMetrics(SM_CYSCREEN)
+        };
+    }
+
+    const int x = ownerRect.left + ((ownerRect.right - ownerRect.left) - width) / 2;
+    const int y = ownerRect.top + ((ownerRect.bottom - ownerRect.top) - height) / 2;
+    SetWindowPos(window, nullptr, std::max(0, x), std::max(0, y), width, height, SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+void RunModal(HWND owner, HWND window) {
+    if (owner) {
+        EnableWindow(owner, FALSE);
+    }
+
+    ShowWindow(window, SW_SHOW);
+    UpdateWindow(window);
+
+    MSG message = {};
+    while (IsWindow(window) && GetMessageW(&message, nullptr, 0, 0) > 0) {
+        if (!IsDialogMessageW(window, &message)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+
+    if (owner && IsWindow(owner)) {
+        EnableWindow(owner, TRUE);
+        SetActiveWindow(owner);
+    }
+}
+
+void ShowModal(DialogState* state, int width, int height) {
+    RegisterDialogClasses(state->instance);
+
+    HWND window = CreateWindowExW(
+        WS_EX_DLGMODALFRAME,
+        kDialogClassName,
+        state->title.c_str(),
+        WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        0,
+        0,
+        width,
+        height,
+        state->owner,
+        nullptr,
+        state->instance,
+        state
+    );
+    if (!window) {
+        delete state;
+        return;
+    }
+
+    CenterWindow(window, state->owner, width, height);
+    RunModal(state->owner, window);
+}
+
+void LayoutMessageDialog(DialogState* state, int width, int height) {
+    if (state->scrollText) {
+        MoveWindow(state->scrollText, 24, 92, width - 48, height - 168, TRUE);
+    }
+
+    const int panelRight = width - kDialogPanelInset;
+    const int panelBottom = height - kDialogPanelInset;
+    const int buttonY = panelBottom - kDialogButtonInset - kDialogButtonHeight;
+    HWND copyButton = GetDlgItem(state->window, IdCopy);
+    HWND okButton = GetDlgItem(state->window, IdOk);
+    if (copyButton) {
+        MoveWindow(
+            copyButton,
+            panelRight - kDialogButtonInset - 112 - kDialogButtonGap - 140,
+            buttonY,
+            140,
+            kDialogButtonHeight,
+            TRUE
+        );
+    }
+    if (okButton) {
+        MoveWindow(okButton, panelRight - kDialogButtonInset - 112, buttonY, 112, kDialogButtonHeight, TRUE);
+    }
+}
+
+void LayoutFfmpegDialog(DialogState* state, int width, int height) {
+    const int panelLeft = kDialogPanelInset;
+    const int panelRight = width - kDialogPanelInset;
+    const int panelBottom = height - kDialogPanelInset;
+    const int buttonY = panelBottom - kDialogButtonInset - kDialogButtonHeight;
+    const int buttonLeft = panelLeft + kDialogButtonInset;
+    const int availableWidth = panelRight - panelLeft - (kDialogButtonInset * 2);
+    const int buttonWidth = (availableWidth - (kDialogButtonGap * 2)) / 3;
+    const std::array<int, 3> ids = {IdInstall, IdChoose, IdSkip};
+    int x = buttonLeft;
+    for (int id : ids) {
+        HWND button = GetDlgItem(state->window, id);
+        if (button) {
+            MoveWindow(button, x, buttonY, buttonWidth, kDialogButtonHeight, TRUE);
+            x += buttonWidth + kDialogButtonGap;
+        }
+    }
+}
+
+void LayoutSettingsDialog(DialogState* state, int width, int height) {
+    UNREFERENCED_PARAMETER(width);
+
+    const std::array<int, 6> qualityIds = {101, 102, 103, 104, 105, 106};
+    int x = 24;
+    for (int id : qualityIds) {
+        HWND button = GetDlgItem(state->window, id);
+        if (button) {
+            MoveWindow(button, x, 118, 82, 32, TRUE);
+            x += 90;
+        }
+    }
+
+    const std::array<int, 4> containerIds = {111, 112, 113, 114};
+    x = 24;
+    for (int id : containerIds) {
+        HWND button = GetDlgItem(state->window, id);
+        if (button) {
+            MoveWindow(button, x, 206, 96, 32, TRUE);
+            x += 104;
+        }
+    }
+
+    HWND ffmpeg = GetDlgItem(state->window, IdFfmpeg);
+    HWND about = GetDlgItem(state->window, IdAbout);
+    HWND cancel = GetDlgItem(state->window, IdCancel);
+    HWND ok = GetDlgItem(state->window, IdOk);
+    if (ffmpeg) {
+        MoveWindow(ffmpeg, 24, 328, 178, 34, TRUE);
+    }
+    if (about) {
+        MoveWindow(about, 214, 328, 150, 34, TRUE);
+    }
+    const int panelRight = width - kDialogPanelInset;
+    const int panelBottom = height - kDialogPanelInset;
+    const int bottomButtonY = panelBottom - kDialogButtonInset - kDialogButtonHeight;
+    if (cancel) {
+        MoveWindow(
+            cancel,
+            panelRight - kDialogButtonInset - 112 - kDialogButtonGap - 112,
+            bottomButtonY,
+            112,
+            kDialogButtonHeight,
+            TRUE
+        );
+    }
+    if (ok) {
+        MoveWindow(ok, panelRight - kDialogButtonInset - 112, bottomButtonY, 112, kDialogButtonHeight, TRUE);
+    }
+}
+
+void LayoutDialog(DialogState* state, int width, int height) {
+    switch (state->type) {
+    case DialogType::Info:
+    case DialogType::Error:
+    case DialogType::About:
+        LayoutMessageDialog(state, width, height);
+        break;
+    case DialogType::Ffmpeg:
+        LayoutFfmpegDialog(state, width, height);
+        break;
+    case DialogType::Settings:
+        LayoutSettingsDialog(state, width, height);
+        break;
+    }
+}
+
+void DrawDialogBackground(HDC dc, const RECT& client) {
+    UiRenderer::DrawBackground(dc, client);
+
+    RECT panel = {kDialogPanelInset, kDialogPanelInset, client.right - kDialogPanelInset, client.bottom - kDialogPanelInset};
+    UiRenderer::DrawPanel(dc, panel);
+}
+
+void DrawMessageDialog(DialogState* state, HDC dc, const RECT& client) {
+    DrawDialogBackground(dc, client);
+
+    HFONT titleFont = CreateUiFont(-18, FW_SEMIBOLD);
+    HFONT textFont = CreateUiFont(-15, FW_NORMAL);
+
+    RECT titleRect = {24, 28, client.right - 24, 56};
+    DrawTextBlock(dc, state->title, titleRect, kTextColor, titleFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    const std::wstring subtitle = state->type == DialogType::Error
+        ? L"Ошибка. Текст можно скопировать для диагностики."
+        : L"Информация приложения.";
+    RECT subtitleRect = {24, 56, client.right - 24, 82};
+    DrawTextBlock(dc, subtitle, subtitleRect, kMutedTextColor, textFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    DeleteObject(titleFont);
+    DeleteObject(textFont);
+}
+
+void DrawFfmpegDialog(DialogState* state, HDC dc, const RECT& client) {
+    DrawDialogBackground(dc, client);
+
+    HFONT titleFont = CreateUiFont(-18, FW_SEMIBOLD);
+    HFONT textFont = CreateUiFont(-15, FW_NORMAL);
+
+    RECT titleRect = {24, 28, client.right - 24, 58};
+    DrawTextBlock(dc, state->title, titleRect, kTextColor, titleFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    RECT messageRect = {24, 76, client.right - 24, 206};
+    DrawTextBlock(
+        dc,
+        L"FFmpeg не найден. Без него приложение сможет скачивать только готовые единые файлы без переконвертации и объединения отдельных видео/аудио дорожек.",
+        messageRect,
+        kTextColor,
+        textFont,
+        DT_LEFT | DT_WORDBREAK
+    );
+
+    DeleteObject(titleFont);
+    DeleteObject(textFont);
+}
+
+void DrawSettingsDialog(DialogState* state, HDC dc, const RECT& client) {
+    DrawDialogBackground(dc, client);
+
+    HFONT titleFont = CreateUiFont(-18, FW_SEMIBOLD);
+    HFONT labelFont = CreateUiFont(-15, FW_SEMIBOLD);
+    HFONT textFont = CreateUiFont(-14, FW_NORMAL);
+
+    RECT titleRect = {24, 28, client.right - 24, 58};
+    DrawTextBlock(dc, state->title, titleRect, kTextColor, titleFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    RECT qualityLabel = {24, 84, client.right - 24, 110};
+    DrawTextBlock(dc, L"Качество по умолчанию", qualityLabel, kTextColor, labelFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    RECT containerLabel = {24, 172, client.right - 24, 198};
+    DrawTextBlock(dc, L"Контейнер", containerLabel, kTextColor, labelFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    RECT behaviorLabel = {24, 266, client.right - 24, 292};
+    DrawTextBlock(dc, L"Поведение", behaviorLabel, kTextColor, labelFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    RECT behaviorText = {24, 292, client.right - 24, 318};
+    DrawTextBlock(
+        dc,
+        L"Автопроверка обновлений включена. Максимум параллельных загрузок: 3.",
+        behaviorText,
+        kMutedTextColor,
+        textFont,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE
+    );
+
+    RECT noteRect = {24, 382, client.right - 24, 424};
+    DrawTextBlock(
+        dc,
+        L"Это UI-заготовка настроек. Следующим слоем сюда будет подключен ConfigStore и реальные действия yt-dlp/FFmpeg.",
+        noteRect,
+        kMutedTextColor,
+        textFont,
+        DT_LEFT | DT_WORDBREAK
+    );
+
+    DeleteObject(titleFont);
+    DeleteObject(labelFont);
+    DeleteObject(textFont);
+}
+
+void CreateMessageControls(DialogState* state) {
+    state->scrollText = CreateScrollText(state->window, state->instance, state->message);
+    CreateDarkButton(state->window, state->instance, L"Скопировать", IdCopy, false);
+    CreateDarkButton(state->window, state->instance, L"OK", IdOk, true);
+}
+
+void CreateFfmpegControls(DialogState* state) {
+    CreateDarkButton(state->window, state->instance, L"Установить", IdInstall, true);
+    CreateDarkButton(state->window, state->instance, L"Выбрать путь", IdChoose, false);
+    CreateDarkButton(state->window, state->instance, L"Пропустить", IdSkip, false);
+}
+
+void CreateSettingsControls(DialogState* state) {
+    const std::array<std::pair<int, const wchar_t*>, 6> qualityButtons = {{
+        {101, L"Аудио"},
+        {102, L"360p"},
+        {103, L"480p"},
+        {104, L"720p"},
+        {105, L"1080p"},
+        {106, L"Макс."}
+    }};
+    for (const auto& [id, text] : qualityButtons) {
+        CreateDarkButton(state->window, state->instance, text, id, id == 105);
+    }
+
+    const std::array<std::pair<int, const wchar_t*>, 4> containerButtons = {{
+        {111, L"Auto"},
+        {112, L"MP4"},
+        {113, L"MKV"},
+        {114, L"WEBM"}
+    }};
+    for (const auto& [id, text] : containerButtons) {
+        CreateDarkButton(state->window, state->instance, text, id, id == 111);
+    }
+
+    CreateDarkButton(state->window, state->instance, L"FFmpeg", IdFfmpeg, false);
+    CreateDarkButton(state->window, state->instance, L"О программе", IdAbout, false);
+    CreateDarkButton(state->window, state->instance, L"Отмена", IdCancel, false);
+    CreateDarkButton(state->window, state->instance, L"Сохранить", IdOk, true);
+}
+
+void RegisterDialogClasses(HINSTANCE instance) {
+    WNDCLASSEXW dialogClass = {};
+    dialogClass.cbSize = sizeof(dialogClass);
+    dialogClass.lpfnWndProc = DialogWindowProc;
+    dialogClass.hInstance = instance;
+    dialogClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    dialogClass.hbrBackground = nullptr;
+    dialogClass.lpszClassName = kDialogClassName;
+    RegisterClassExW(&dialogClass);
+
+    WNDCLASSEXW buttonClass = {};
+    buttonClass.cbSize = sizeof(buttonClass);
+    buttonClass.lpfnWndProc = DialogButtonProc;
+    buttonClass.hInstance = instance;
+    buttonClass.hCursor = LoadCursorW(nullptr, IDC_HAND);
+    buttonClass.hbrBackground = nullptr;
+    buttonClass.lpszClassName = kDialogButtonClassName;
+    RegisterClassExW(&buttonClass);
+
+    WNDCLASSEXW scrollTextClass = {};
+    scrollTextClass.cbSize = sizeof(scrollTextClass);
+    scrollTextClass.lpfnWndProc = ScrollTextProc;
+    scrollTextClass.hInstance = instance;
+    scrollTextClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    scrollTextClass.hbrBackground = nullptr;
+    scrollTextClass.lpszClassName = kScrollTextClassName;
+    RegisterClassExW(&scrollTextClass);
+}
+
+LRESULT CALLBACK DialogWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    DialogState* state = reinterpret_cast<DialogState*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        const CREATESTRUCTW* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        state = static_cast<DialogState*>(create->lpCreateParams);
+        state->window = window;
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+        EnableDarkTitleBar(window);
+        return TRUE;
+    }
+
+    switch (message) {
+    case WM_CREATE:
+        if (state) {
+            if (state->type == DialogType::Settings) {
+                CreateSettingsControls(state);
+            } else if (state->type == DialogType::Ffmpeg) {
+                CreateFfmpegControls(state);
+            } else {
+                CreateMessageControls(state);
+            }
+            RECT client = {};
+            GetClientRect(window, &client);
+            LayoutDialog(state, client.right, client.bottom);
+        }
+        return 0;
+
+    case WM_SIZE:
+        if (state) {
+            LayoutDialog(state, LOWORD(lParam), HIWORD(lParam));
+        }
+        return 0;
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT:
+        if (state) {
+            PAINTSTRUCT paint = {};
+            HDC dc = BeginPaint(window, &paint);
+            RECT client = {};
+            GetClientRect(window, &client);
+            if (state->type == DialogType::Settings) {
+                DrawSettingsDialog(state, dc, client);
+            } else if (state->type == DialogType::Ffmpeg) {
+                DrawFfmpegDialog(state, dc, client);
+            } else {
+                DrawMessageDialog(state, dc, client);
+            }
+            EndPaint(window, &paint);
+        }
+        return 0;
+
+    case WM_COMMAND:
+        if (state) {
+            switch (LOWORD(wParam)) {
+            case IdCopy:
+                CopyToClipboard(window, state->message);
+                return 0;
+            case IdAbout:
+                ShowAboutDialog(window, state->instance);
+                return 0;
+            case IdFfmpeg:
+                ShowFfmpegDialog(window, state->instance);
+                return 0;
+            case IdInstall:
+            case IdChoose:
+            case IdSkip:
+            case IdOk:
+            case IdCancel:
+                DestroyWindow(window);
+                return 0;
+            default:
+                return 0;
+            }
+        }
+        break;
+
+    case WM_CLOSE:
+        DestroyWindow(window);
+        return 0;
+
+    case WM_NCDESTROY:
+        delete state;
+        SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+        return 0;
+    }
+
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+LRESULT CALLBACK DialogButtonProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    ButtonState* state = reinterpret_cast<ButtonState*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        const CREATESTRUCTW* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        state = static_cast<ButtonState*>(create->lpCreateParams);
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+        return TRUE;
+    }
+
+    switch (message) {
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_MOUSEMOVE:
+        if (state && !state->hot) {
+            state->hot = true;
+            TRACKMOUSEEVENT track = {};
+            track.cbSize = sizeof(track);
+            track.dwFlags = TME_LEAVE;
+            track.hwndTrack = window;
+            TrackMouseEvent(&track);
+            InvalidateRect(window, nullptr, TRUE);
+        }
+        return 0;
+
+    case WM_MOUSELEAVE:
+        if (state) {
+            state->hot = false;
+            state->pressed = false;
+            InvalidateRect(window, nullptr, TRUE);
+        }
+        return 0;
+
+    case WM_LBUTTONDOWN:
+        if (state) {
+            state->pressed = true;
+            SetCapture(window);
+            SetFocus(window);
+            InvalidateRect(window, nullptr, TRUE);
+        }
+        return 0;
+
+    case WM_LBUTTONUP:
+        if (state) {
+            if (GetCapture() == window) {
+                ReleaseCapture();
+            }
+            const bool wasPressed = state->pressed;
+            state->pressed = false;
+            InvalidateRect(window, nullptr, TRUE);
+
+            POINT point = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            RECT client = {};
+            GetClientRect(window, &client);
+            if (wasPressed && PtInRect(&client, point)) {
+                SendMessageW(
+                    GetParent(window),
+                    WM_COMMAND,
+                    MAKEWPARAM(state->commandId, BN_CLICKED),
+                    reinterpret_cast<LPARAM>(window)
+                );
+            }
+        }
+        return 0;
+
+    case WM_KEYDOWN:
+        if (state && (wParam == VK_SPACE || wParam == VK_RETURN)) {
+            SendMessageW(
+                GetParent(window),
+                WM_COMMAND,
+                MAKEWPARAM(state->commandId, BN_CLICKED),
+                reinterpret_cast<LPARAM>(window)
+            );
+            return 0;
+        }
+        break;
+
+    case WM_PAINT:
+        {
+            PAINTSTRUCT paint = {};
+            HDC dc = BeginPaint(window, &paint);
+            RECT client = {};
+            GetClientRect(window, &client);
+            if (state) {
+                UiRenderer::DrawButton(dc, client, state->text.c_str(), state->primary, state->pressed, state->hot, true);
+            }
+            EndPaint(window, &paint);
+        }
+        return 0;
+
+    case WM_NCDESTROY:
+        delete state;
+        SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+        return 0;
+    }
+
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+int MeasureTextHeight(HDC dc, HFONT font, const std::wstring& text, int width) {
+    HFONT oldFont = reinterpret_cast<HFONT>(SelectObject(dc, font));
+    RECT measure = {0, 0, width, 1};
+    DrawTextW(dc, text.c_str(), -1, &measure, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+    SelectObject(dc, oldFont);
+    return measure.bottom - measure.top;
+}
+
+bool ClampScroll(HWND window, ScrollTextState* state, int visibleHeight) {
+    UNREFERENCED_PARAMETER(window);
+    const int previousScrollY = state->scrollY;
+    const int maxScroll = std::max(0, state->contentHeight - visibleHeight);
+    state->scrollY = std::clamp(state->scrollY, 0, maxScroll);
+    return state->scrollY != previousScrollY;
+}
+
+bool SetScrollY(HWND window, ScrollTextState* state, int desiredScrollY, int visibleHeight) {
+    const int previousScrollY = state->scrollY;
+    state->scrollY = desiredScrollY;
+    ClampScroll(window, state, visibleHeight);
+    return state->scrollY != previousScrollY;
+}
+
+int GetScrollVisibleEnd(const RECT& client) {
+    return std::max(1, static_cast<int>(client.bottom - client.top) - kScrollTextClipBottomPadding);
+}
+
+RECT GetScrollbarThumb(const RECT& client, int contentHeight, int scrollY) {
+    constexpr int barWidth = 8;
+    constexpr int padding = 6;
+    RECT track = {client.right - barWidth - padding, client.top + padding, client.right - padding, client.bottom - padding};
+    const int trackHeight = std::max(1, static_cast<int>(track.bottom - track.top));
+    const int visibleHeight = GetScrollVisibleEnd(client);
+    const int thumbHeight = std::clamp((visibleHeight * trackHeight) / std::max(visibleHeight, contentHeight), 28, trackHeight);
+    const int maxScroll = std::max(1, contentHeight - visibleHeight);
+    const int maxThumbTravel = std::max(0, trackHeight - thumbHeight);
+    const int thumbTop = static_cast<int>(track.top) + (scrollY * maxThumbTravel) / maxScroll;
+    return {track.left, thumbTop, track.right, thumbTop + thumbHeight};
+}
+
+LRESULT CALLBACK ScrollTextProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    ScrollTextState* state = reinterpret_cast<ScrollTextState*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        const CREATESTRUCTW* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        state = static_cast<ScrollTextState*>(create->lpCreateParams);
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+        return TRUE;
+    }
+
+    switch (message) {
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_MOUSEWHEEL:
+        if (state) {
+            RECT client = {};
+            GetClientRect(window, &client);
+            const int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+            const int desiredScrollY = state->scrollY - ((delta / WHEEL_DELTA) * 42);
+            if (SetScrollY(window, state, desiredScrollY, GetScrollVisibleEnd(client))) {
+                InvalidateRect(window, nullptr, TRUE);
+            }
+        }
+        return 0;
+
+    case WM_LBUTTONDOWN:
+        if (state) {
+            RECT client = {};
+            GetClientRect(window, &client);
+            RECT thumb = GetScrollbarThumb(client, state->contentHeight, state->scrollY);
+            POINT point = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            if (state->contentHeight > GetScrollVisibleEnd(client) && PtInRect(&thumb, point)) {
+                state->draggingThumb = true;
+                state->dragStartY = point.y;
+                state->dragStartScrollY = state->scrollY;
+                SetCapture(window);
+            }
+        }
+        return 0;
+
+    case WM_MOUSEMOVE:
+        if (state && state->draggingThumb) {
+            RECT client = {};
+            GetClientRect(window, &client);
+            RECT thumb = GetScrollbarThumb(client, state->contentHeight, state->scrollY);
+            const int visibleHeight = GetScrollVisibleEnd(client);
+            const int maxScroll = std::max(0, state->contentHeight - visibleHeight);
+            const int trackTravel = std::max(
+                1,
+                static_cast<int>(client.bottom - client.top) - 12 - static_cast<int>(thumb.bottom - thumb.top)
+            );
+            const int dy = GET_Y_LPARAM(lParam) - state->dragStartY;
+            const int desiredScrollY = state->dragStartScrollY + (dy * maxScroll) / trackTravel;
+            if (SetScrollY(window, state, desiredScrollY, visibleHeight)) {
+                InvalidateRect(window, nullptr, TRUE);
+            }
+        }
+        return 0;
+
+    case WM_LBUTTONUP:
+        if (state && state->draggingThumb) {
+            state->draggingThumb = false;
+            if (GetCapture() == window) {
+                ReleaseCapture();
+            }
+        }
+        return 0;
+
+    case WM_PAINT:
+        if (state) {
+            PAINTSTRUCT paint = {};
+            HDC dc = BeginPaint(window, &paint);
+            RECT client = {};
+            GetClientRect(window, &client);
+
+            UiRenderer::DrawInputFrame(dc, client);
+
+            HFONT font = CreateUiFont(-15, FW_NORMAL);
+            const int textWidth = std::max(40, static_cast<int>(client.right - client.left) - 38);
+            const int textHeight = MeasureTextHeight(dc, font, state->text, textWidth);
+            state->contentHeight = textHeight + kScrollTextTopPadding + kScrollTextBottomPadding;
+            ClampScroll(window, state, GetScrollVisibleEnd(client));
+
+            RECT textRect = {
+                client.left + 14,
+                client.top + kScrollTextTopPadding - state->scrollY,
+                client.right - 24,
+                client.top + kScrollTextTopPadding - state->scrollY + textHeight
+            };
+            HRGN clip = CreateRectRgn(
+                client.left + 10,
+                client.top + kScrollTextClipTopPadding,
+                client.right - 16,
+                client.bottom - kScrollTextClipBottomPadding
+            );
+            SelectClipRgn(dc, clip);
+            DrawTextBlock(dc, state->text, textRect, kTextColor, font, DT_LEFT | DT_WORDBREAK);
+            SelectClipRgn(dc, nullptr);
+            DeleteObject(clip);
+
+            if (state->contentHeight > GetScrollVisibleEnd(client)) {
+                Gdiplus::Graphics graphics(dc);
+                graphics.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+                RECT thumb = GetScrollbarThumb(client, state->contentHeight, state->scrollY);
+                Gdiplus::SolidBrush trackBrush(Gdiplus::Color(255, 39, 39, 43));
+                Gdiplus::SolidBrush thumbBrush(Gdiplus::Color(255, 86, 86, 92));
+                graphics.FillRectangle(
+                    &trackBrush,
+                    static_cast<INT>(client.right - 14),
+                    static_cast<INT>(client.top + 8),
+                    6,
+                    static_cast<INT>(client.bottom - client.top - 16)
+                );
+                graphics.FillRectangle(
+                    &thumbBrush,
+                    static_cast<INT>(thumb.left),
+                    static_cast<INT>(thumb.top),
+                    static_cast<INT>(thumb.right - thumb.left),
+                    static_cast<INT>(thumb.bottom - thumb.top)
+                );
+            }
+
+            DeleteObject(font);
+            EndPaint(window, &paint);
+        }
+        return 0;
+
+    case WM_NCDESTROY:
+        delete state;
+        SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+        return 0;
+    }
+
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+} // namespace
+
+void ShowInfoDialog(HWND owner, HINSTANCE instance, const std::wstring& title, const std::wstring& message) {
+    auto* state = new DialogState{};
+    state->type = DialogType::Info;
+    state->instance = instance;
+    state->owner = owner;
+    state->title = title;
+    state->message = message;
+    ShowModal(state, 560, 360);
+}
+
+void ShowErrorDialog(HWND owner, HINSTANCE instance, const std::wstring& title, const std::wstring& message) {
+    auto* state = new DialogState{};
+    state->type = DialogType::Error;
+    state->instance = instance;
+    state->owner = owner;
+    state->title = title;
+    state->message = message;
+    ShowModal(state, 620, 420);
+}
+
+void ShowSettingsDialog(HWND owner, HINSTANCE instance) {
+    auto* state = new DialogState{};
+    state->type = DialogType::Settings;
+    state->instance = instance;
+    state->owner = owner;
+    state->title = L"Настройки";
+    ShowModal(state, 620, 560);
+}
+
+void ShowAboutDialog(HWND owner, HINSTANCE instance) {
+    auto* state = new DialogState{};
+    state->type = DialogType::About;
+    state->instance = instance;
+    state->owner = owner;
+    state->title = L"О программе";
+    state->message =
+        L"YouTube Downloader\n\n"
+        L"Портативный Win32 загрузчик видео с YouTube.\n\n"
+        L"Версия UI-прототипа: 0.1.0";
+    ShowModal(state, 560, 360);
+}
+
+void ShowFfmpegDialog(HWND owner, HINSTANCE instance) {
+    auto* state = new DialogState{};
+    state->type = DialogType::Ffmpeg;
+    state->instance = instance;
+    state->owner = owner;
+    state->title = L"FFmpeg не найден";
+    ShowModal(state, 600, 370);
+}

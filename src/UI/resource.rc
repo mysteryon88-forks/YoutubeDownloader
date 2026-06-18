@@ -1,11 +1,12 @@
 #include "resource.h"
+#include "../Core/AppVersion.h"
 #include <windows.h>
 
 IDI_MAIN_ICON ICON "../../assets/icon.ico"
 
 1 VERSIONINFO
-FILEVERSION 1,0,0,0
-PRODUCTVERSION 1,0,0,0
+FILEVERSION YTD_APP_FILE_VERSION_RC
+PRODUCTVERSION YTD_APP_FILE_VERSION_RC
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0x0L
 FILEOS 0x40004L
@@ -18,12 +19,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Laynholt"
             VALUE "FileDescription", "Portable Win32 YouTube downloader"
-            VALUE "FileVersion", "1.0.0.0"
+            VALUE "FileVersion", YTD_APP_FILE_VERSION_STRING
             VALUE "InternalName", "YoutubeDownloader"
             VALUE "LegalCopyright", "Copyright (C) 2026"
             VALUE "OriginalFilename", "YoutubeDownloader.exe"
             VALUE "ProductName", "YouTube Downloader"
-            VALUE "ProductVersion", "1.0.0.0"
+            VALUE "ProductVersion", YTD_APP_FILE_VERSION_STRING
         END
     END
     BLOCK "VarFileInfo"

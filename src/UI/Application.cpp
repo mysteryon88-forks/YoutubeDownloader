@@ -39,6 +39,7 @@ constexpr COLORREF kTextColor = RGB(242, 242, 242);
 constexpr COLORREF kMutedTextColor = RGB(172, 172, 178);
 constexpr UINT kMsgToolCheckComplete = WM_APP + 1;
 constexpr UINT kMsgPreviewComplete = WM_APP + 2;
+constexpr UINT kMsgAppUpdateCheckComplete = WM_APP + 3;
 constexpr UINT_PTR kQueueRefreshTimer = 1;
 constexpr UINT_PTR kStatusRestoreTimer = 2;
 constexpr UINT_PTR kPreviewLoadingTimer = 3;
@@ -82,6 +83,12 @@ struct PreviewFetchResult {
     std::wstring url;
     bool ok = false;
     VideoPreview preview;
+    std::wstring error;
+};
+
+struct AppUpdateCheckResult {
+    bool ok = false;
+    ReleaseAssetInfo release;
     std::wstring error;
 };
 
@@ -556,6 +563,9 @@ bool Application::Initialize(HINSTANCE instance, int showCommand) {
 
     ShowWindow(m_window, showCommand);
     UpdateWindow(m_window);
+    if (m_config.autoUpdateApp) {
+        StartAppUpdateCheck();
+    }
     return true;
 }
 
@@ -937,6 +947,17 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                 EnableWindow(m_downloadButton, FALSE);
             }
             SetStatus(result->ready ? BuildToolReadyStatus(result->status, m_ffmpeg) : result->message);
+        }
+        return 0;
+
+    case kMsgAppUpdateCheckComplete:
+        {
+            std::unique_ptr<AppUpdateCheckResult> result(reinterpret_cast<AppUpdateCheckResult*>(lParam));
+            if (m_paths && result->ok && ShouldInstallAppUpdate(result->release)) {
+                if (OfferAppUpdate(m_window, m_instance, *m_paths, result->release, false)) {
+                    PostMessageW(m_window, WM_CLOSE, 0, 0);
+                }
+            }
         }
         return 0;
 
@@ -1738,6 +1759,28 @@ void Application::StartToolCheck() {
             result->message = L"Ошибка подготовки yt-dlp";
         }
         PostMessageW(window, kMsgToolCheckComplete, 0, reinterpret_cast<LPARAM>(result));
+    }).detach();
+}
+
+void Application::StartAppUpdateCheck() {
+    if (!m_paths || !m_window) {
+        return;
+    }
+
+    HWND window = m_window;
+    std::thread([window]() {
+        auto* result = new AppUpdateCheckResult{};
+        try {
+            result->release = AppUpdateService::CheckLatestRelease();
+            result->ok = true;
+        } catch (const std::exception& ex) {
+            result->ok = false;
+            result->error = std::wstring(ex.what(), ex.what() + std::strlen(ex.what()));
+        } catch (...) {
+            result->ok = false;
+            result->error = L"Неизвестная ошибка проверки обновлений";
+        }
+        PostMessageW(window, kMsgAppUpdateCheckComplete, 0, reinterpret_cast<LPARAM>(result));
     }).detach();
 }
 

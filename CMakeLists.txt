@@ -1,7 +1,15 @@
 cmake_minimum_required(VERSION 3.20)
 
+file(STRINGS src/Core/AppVersion.h YTD_APP_VERSION_MAJOR_LINE REGEX "^#define YTD_APP_VERSION_MAJOR ")
+file(STRINGS src/Core/AppVersion.h YTD_APP_VERSION_MINOR_LINE REGEX "^#define YTD_APP_VERSION_MINOR ")
+file(STRINGS src/Core/AppVersion.h YTD_APP_VERSION_PATCH_LINE REGEX "^#define YTD_APP_VERSION_PATCH ")
+string(REGEX REPLACE "^#define YTD_APP_VERSION_MAJOR ([0-9]+)$" "\\1" YTD_APP_VERSION_MAJOR "${YTD_APP_VERSION_MAJOR_LINE}")
+string(REGEX REPLACE "^#define YTD_APP_VERSION_MINOR ([0-9]+)$" "\\1" YTD_APP_VERSION_MINOR "${YTD_APP_VERSION_MINOR_LINE}")
+string(REGEX REPLACE "^#define YTD_APP_VERSION_PATCH ([0-9]+)$" "\\1" YTD_APP_VERSION_PATCH "${YTD_APP_VERSION_PATCH_LINE}")
+set(YTD_APP_VERSION "${YTD_APP_VERSION_MAJOR}.${YTD_APP_VERSION_MINOR}.${YTD_APP_VERSION_PATCH}")
+
 project(YoutubeDownloader
-    VERSION 1.0.0
+    VERSION ${YTD_APP_VERSION}
     DESCRIPTION "Portable Win32 YouTube downloader"
     LANGUAGES CXX RC
 )
@@ -16,6 +24,7 @@ endif()
 
 set(CORE_SOURCES
     src/Core/AppPaths.cpp
+    src/Core/AppVersion.h
     src/Core/BackendText.cpp
     src/Core/Config.cpp
     src/Core/DownloadQueue.cpp
@@ -30,6 +39,7 @@ set(CORE_SOURCES
 
 set(CORE_HEADERS
     src/Core/AppPaths.h
+    src/Core/AppVersion.h
     src/Core/BackendText.h
     src/Core/Config.h
     src/Core/DownloadQueue.h

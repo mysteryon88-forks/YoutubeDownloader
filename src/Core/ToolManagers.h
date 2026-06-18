@@ -58,6 +58,7 @@ struct ToolInstallStatus {
 };
 
 bool ShouldInstallYtDlpUpdate(const ToolInstallStatus& current, const ReleaseAssetInfo& latest);
+bool ShouldInstallAppUpdate(const ReleaseAssetInfo& latest);
 
 class YtDlpManager {
 public:
@@ -74,9 +75,14 @@ private:
 class AppUpdateService {
 public:
     static ReleaseAssetInfo CheckLatestRelease();
-    static std::filesystem::path DownloadUpdateZip(
+    static std::filesystem::path DownloadUpdateExe(
         const AppPaths& paths,
         const ReleaseAssetInfo& release,
+        const std::function<void(std::uint64_t downloaded, std::uint64_t total)>& onProgress = {},
         HANDLE cancelEvent = nullptr
+    );
+    static void StartDownloadedUpdate(
+        const AppPaths& paths,
+        const std::filesystem::path& downloadedExe
     );
 };

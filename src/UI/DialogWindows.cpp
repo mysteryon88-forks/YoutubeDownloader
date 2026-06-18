@@ -1,5 +1,6 @@
 #include "DialogWindows.h"
 
+#include "AppVersion.h"
 #include "ToolManagers.h"
 #include "UiRenderer.h"
 
@@ -21,6 +22,7 @@
 #include <vector>
 
 bool ShowFfmpegInstallProgress(HWND owner, HINSTANCE instance, const AppPaths& paths, AppConfig& config);
+bool ShowAppUpdateProgress(HWND owner, HINSTANCE instance, const AppPaths& paths, const ReleaseAssetInfo& release);
 
 namespace {
 
@@ -51,6 +53,11 @@ enum class DialogType {
     About,
     Ffmpeg,
     Progress
+};
+
+enum class ProgressMode {
+    FfmpegInstall,
+    AppUpdate
 };
 
 enum DialogCommand {
@@ -103,6 +110,8 @@ struct DialogState {
     HANDLE cancelEvent = nullptr;
     bool progressDone = false;
     bool progressSuccess = false;
+    ProgressMode progressMode = ProgressMode::FfmpegInstall;
+    ReleaseAssetInfo release;
 };
 
 struct ProgressUpdate {
@@ -839,6 +848,45 @@ void StartFfmpegInstallWorker(DialogState* state) {
     }).detach();
 }
 
+void StartAppUpdateWorker(DialogState* state) {
+    if (!state || !state->paths || !state->cancelEvent) {
+        return;
+    }
+
+    HWND window = state->window;
+    const AppPaths paths = *state->paths;
+    const ReleaseAssetInfo release = state->release;
+    HANDLE cancelEvent = state->cancelEvent;
+
+    std::thread([window, paths, release, cancelEvent]() {
+        try {
+            const std::filesystem::path downloadedExe = AppUpdateService::DownloadUpdateExe(
+                paths,
+                release,
+                [window](std::uint64_t downloaded, std::uint64_t total) {
+                    auto* update = new ProgressUpdate{};
+                    update->downloaded = downloaded;
+                    update->total = total;
+                    update->status = L"Скачивание обновления...";
+                    PostMessageW(window, kProgressUpdateMessage, 0, reinterpret_cast<LPARAM>(update));
+                },
+                cancelEvent
+            );
+            if (cancelEvent && WaitForSingleObject(cancelEvent, 0) == WAIT_OBJECT_0) {
+                throw std::runtime_error("operation canceled");
+            }
+            AppUpdateService::StartDownloadedUpdate(paths, downloadedExe);
+            PostMessageW(window, kProgressDoneMessage, TRUE, 0);
+        } catch (const std::exception& ex) {
+            auto* error = new std::wstring(ex.what(), ex.what() + std::strlen(ex.what()));
+            PostMessageW(window, kProgressDoneMessage, FALSE, reinterpret_cast<LPARAM>(error));
+        } catch (...) {
+            auto* error = new std::wstring(L"Неизвестная ошибка обновления приложения");
+            PostMessageW(window, kProgressDoneMessage, FALSE, reinterpret_cast<LPARAM>(error));
+        }
+    }).detach();
+}
+
 void CreateProgressControls(DialogState* state) {
     state->progressBar = CreateWindowExW(
         0,
@@ -859,8 +907,12 @@ void CreateProgressControls(DialogState* state) {
         SendMessageW(state->progressBar, PBM_SETPOS, 0, 0);
     }
     HWND cancelButton = CreateDarkButton(state->window, state->instance, L"Отмена", IdCancel, false);
-    AddDialogTooltip(state, cancelButton, L"Отменяет текущую установку FFmpeg.");
-    StartFfmpegInstallWorker(state);
+    AddDialogTooltip(state, cancelButton, L"Отменяет текущую операцию.");
+    if (state->progressMode == ProgressMode::AppUpdate) {
+        StartAppUpdateWorker(state);
+    } else {
+        StartFfmpegInstallWorker(state);
+    }
 }
 
 void CreateSettingsControls(DialogState* state) {
@@ -1066,29 +1118,24 @@ LRESULT CALLBACK DialogWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
                 CopyToClipboard(window, state->message);
                 return 0;
             case IdCheckUpdates:
-                try {
-                    const ReleaseAssetInfo release = AppUpdateService::CheckLatestRelease();
-                    if (release.found) {
-                        ShowInfoDialog(
-                            window,
-                            state->instance,
-                            L"Обновление найдено",
-                            L"Последняя версия: " + release.version + L"\n\n" + release.pageUrl
-                        );
-                    } else {
-                        ShowInfoDialog(window, state->instance, L"Обновления", L"Не удалось найти установочный архив в последнем релизе.");
+                if (!state->paths) {
+                    ShowErrorDialog(window, state->instance, L"Обновления", L"Путь приложения недоступен.");
+                    return 0;
+                }
+                if (CheckAndOfferAppUpdate(window, state->instance, *state->paths, true)) {
+                    HWND owner = GetAncestor(window, GA_ROOTOWNER);
+                    DestroyWindow(window);
+                    if (owner && IsWindow(owner)) {
+                        PostMessageW(owner, WM_CLOSE, 0, 0);
                     }
-                } catch (const std::exception& ex) {
-                    ShowErrorDialog(
-                        window,
-                        state->instance,
-                        L"Проверка обновлений не удалась",
-                        std::wstring(ex.what(), ex.what() + std::strlen(ex.what()))
-                    );
                 }
                 return 0;
             case IdAbout:
-                ShowAboutDialog(window, state->instance);
+                if (state->paths) {
+                    ShowAboutDialog(window, state->instance, *state->paths);
+                } else {
+                    ShowAboutDialog(window, state->instance);
+                }
                 return 0;
             case IdFfmpeg:
                 if (state->paths && state->config && ShowFfmpegDialog(window, state->instance, *state->paths, state->workingConfig)) {
@@ -1179,16 +1226,26 @@ LRESULT CALLBACK DialogWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
             state->progressDone = true;
             state->progressSuccess = wParam == TRUE;
             if (state->progressSuccess) {
-                state->message = L"FFmpeg установлен.";
+                state->message = state->progressMode == ProgressMode::AppUpdate
+                    ? L"Обновление скачано. Приложение будет закрыто и запущено заново."
+                    : L"FFmpeg установлен.";
                 if (state->progressBar) {
                     SendMessageW(state->progressBar, PBM_SETPOS, 100, 0);
                 }
                 if (state->savedResult) {
                     *state->savedResult = true;
                 }
+                if (state->progressMode == ProgressMode::AppUpdate) {
+                    DestroyWindow(window);
+                    return 0;
+                }
             } else {
                 std::unique_ptr<std::wstring> error(reinterpret_cast<std::wstring*>(lParam));
-                state->message = error ? *error : L"Не удалось установить FFmpeg.";
+                state->message = error
+                    ? *error
+                    : (state->progressMode == ProgressMode::AppUpdate
+                        ? L"Не удалось обновить приложение."
+                        : L"Не удалось установить FFmpeg.");
             }
             SetDarkButtonState(window, IdCancel, state->progressSuccess, L"OK");
             InvalidateRect(window, nullptr, FALSE);
@@ -1196,6 +1253,14 @@ LRESULT CALLBACK DialogWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
         return 0;
 
     case WM_CLOSE:
+        if (state && state->type == DialogType::Progress && !state->progressDone) {
+            if (state->cancelEvent) {
+                SetEvent(state->cancelEvent);
+            }
+            state->message = L"Отмена...";
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+        }
         DestroyWindow(window);
         return 0;
 
@@ -1540,15 +1605,21 @@ bool ShowSettingsDialog(HWND owner, HINSTANCE instance, const AppPaths& paths, A
 }
 
 void ShowAboutDialog(HWND owner, HINSTANCE instance) {
+    AppPaths emptyPaths(std::filesystem::path{});
+    ShowAboutDialog(owner, instance, emptyPaths);
+}
+
+void ShowAboutDialog(HWND owner, HINSTANCE instance, const AppPaths& paths) {
     auto* state = new DialogState{};
     state->type = DialogType::About;
     state->instance = instance;
     state->owner = owner;
+    state->paths = paths.root().empty() ? nullptr : &paths;
     state->title = L"О программе";
     state->message =
         L"YouTube Downloader\n\n"
         L"Портативный Win32 загрузчик видео с YouTube.\n\n"
-        L"Версия: 1.0.0";
+        L"Версия: " YTD_APP_VERSION_WIDE;
     ShowModal(state, 560, 360);
 }
 
@@ -1588,4 +1659,74 @@ bool ShowFfmpegInstallProgress(HWND owner, HINSTANCE instance, const AppPaths& p
     state->savedResult = &saved;
     ShowModal(state, 560, 230);
     return saved;
+}
+
+bool ShowAppUpdateProgress(HWND owner, HINSTANCE instance, const AppPaths& paths, const ReleaseAssetInfo& release) {
+    auto* state = new DialogState{};
+    state->type = DialogType::Progress;
+    state->progressMode = ProgressMode::AppUpdate;
+    state->instance = instance;
+    state->owner = owner;
+    state->title = L"Обновление приложения";
+    state->message = L"Подготовка...";
+    state->paths = &paths;
+    state->release = release;
+    state->cancelEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    bool updated = false;
+    state->savedResult = &updated;
+    ShowModal(state, 560, 230);
+    return updated;
+}
+
+bool OfferAppUpdate(HWND owner, HINSTANCE instance, const AppPaths& paths, const ReleaseAssetInfo& release, bool notifyWhenCurrent) {
+    if (!release.found) {
+        if (notifyWhenCurrent) {
+            ShowInfoDialog(owner, instance, L"Обновления", L"В последнем релизе не найден файл YoutubeDownloader.exe.");
+        }
+        return false;
+    }
+
+    if (!ShouldInstallAppUpdate(release)) {
+        if (notifyWhenCurrent) {
+            ShowInfoDialog(
+                owner,
+                instance,
+                L"Обновления",
+                L"Установлена актуальная версия: " YTD_APP_VERSION_WIDE
+            );
+        }
+        return false;
+    }
+
+    const std::wstring message =
+        L"Доступна новая версия: " + release.version +
+        L"\nТекущая версия: " YTD_APP_VERSION_WIDE
+        L"\n\nСкачать и установить обновление сейчас?\nПриложение будет закрыто и запущено заново.";
+    const int choice = MessageBoxW(owner, message.c_str(), L"Обновление доступно", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON1);
+    if (choice != IDYES) {
+        return false;
+    }
+
+    return ShowAppUpdateProgress(owner, instance, paths, release);
+}
+
+bool CheckAndOfferAppUpdate(HWND owner, HINSTANCE instance, const AppPaths& paths, bool notifyWhenCurrent) {
+    try {
+        const ReleaseAssetInfo release = AppUpdateService::CheckLatestRelease();
+        return OfferAppUpdate(owner, instance, paths, release, notifyWhenCurrent);
+    } catch (const std::exception& ex) {
+        if (notifyWhenCurrent) {
+            ShowErrorDialog(
+                owner,
+                instance,
+                L"Проверка обновлений не удалась",
+                std::wstring(ex.what(), ex.what() + std::strlen(ex.what()))
+            );
+        }
+    } catch (...) {
+        if (notifyWhenCurrent) {
+            ShowErrorDialog(owner, instance, L"Проверка обновлений не удалась", L"Неизвестная ошибка.");
+        }
+    }
+    return false;
 }

@@ -1,5 +1,7 @@
 #include "WinHttpClient.h"
 
+#include "AppVersion.h"
+
 #include <winhttp.h>
 
 #include <array>
@@ -138,7 +140,7 @@ DWORD QueryStatusCode(HINTERNET request) {
 HttpRequest OpenRequest(const std::wstring& url, int redirectsRemaining = 8) {
     const UrlParts parts = CrackUrl(url);
     InternetHandle session(WinHttpOpen(
-        L"YoutubeDownloader/0.1",
+        L"YoutubeDownloader/" YTD_APP_VERSION_WIDE,
         WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS,

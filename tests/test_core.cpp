@@ -1,4 +1,5 @@
 #include "AppPaths.h"
+#include "AppVersion.h"
 #include "BackendText.h"
 #include "Config.h"
 #include "DownloadQueue.h"
@@ -276,17 +277,17 @@ void TestGitHubReleaseParsing() {
   "tag_name": "v1.0.4",
   "html_url": "https://github.com/Laynholt/YoutubeDownloader/releases/tag/v1.0.4",
   "assets": [
-    {"name": "YoutubeDownloader_windows.zip", "browser_download_url": "https://example.invalid/YoutubeDownloader_windows.zip"}
+    {"name": "YoutubeDownloader.exe", "browser_download_url": "https://example.invalid/YoutubeDownloader.exe"}
   ]
 }
 )json";
 
-    const ReleaseAssetInfo app = ParseGitHubReleaseAsset(appRelease, "YoutubeDownloader_windows.zip");
+    const ReleaseAssetInfo app = ParseGitHubReleaseAsset(appRelease, "YoutubeDownloader.exe");
     Require(app.found, "app update asset not found");
     Require(app.version == L"1.0.4", "app release version should be normalized");
-    Require(app.downloadUrl == L"https://example.invalid/YoutubeDownloader_windows.zip", "app asset url mismatch");
+    Require(app.downloadUrl == L"https://example.invalid/YoutubeDownloader.exe", "app asset url mismatch");
 
-    const ReleaseAssetInfo missing = ParseGitHubReleaseAsset(appRelease, "missing.zip");
+    const ReleaseAssetInfo missing = ParseGitHubReleaseAsset(appRelease, "missing.exe");
     Require(!missing.found, "missing asset should not be found");
 }
 
@@ -309,6 +310,23 @@ void TestYtDlpUpdateDecision() {
 
     latest.found = false;
     Require(!ShouldInstallYtDlpUpdate(current, latest), "missing release metadata should not trigger update");
+}
+
+void TestAppUpdateDecision() {
+    ReleaseAssetInfo latest;
+    latest.found = true;
+    latest.version = L"1.0.2";
+    Require(ShouldInstallAppUpdate(latest), "newer app version should be offered");
+
+    latest.version = YTD_APP_VERSION_WIDE;
+    Require(!ShouldInstallAppUpdate(latest), "current app version should not be offered");
+
+    latest.version = L"1.0.0";
+    Require(!ShouldInstallAppUpdate(latest), "older app version should not be offered");
+
+    latest.found = false;
+    latest.version = L"9.9.9";
+    Require(!ShouldInstallAppUpdate(latest), "missing app asset should not trigger update");
 }
 
 void TestFfmpegResolutionPrecedence() {
@@ -1030,6 +1048,7 @@ int main() {
     TestYtDlpProgressParsing();
     TestGitHubReleaseParsing();
     TestYtDlpUpdateDecision();
+    TestAppUpdateDecision();
     TestFfmpegResolutionPrecedence();
     TestFfmpegUserPathAndExtractedTreeResolution();
     TestProcessRunnerCapturesOutputAndExitCode();

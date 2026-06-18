@@ -52,6 +52,7 @@ private:
     void RestoreStatusText();
     void InitializeBackend();
     void StartToolCheck();
+    void StartAppUpdateCheck();
     void StartPreviewFetch();
     void StartPreviewLoadingText();
     void StopPreviewLoadingText();

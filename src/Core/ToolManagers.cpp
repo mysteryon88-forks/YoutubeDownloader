@@ -1,5 +1,6 @@
 #include "ToolManagers.h"
 
+#include "AppVersion.h"
 #include "BackendText.h"
 #include "ProcessRunner.h"
 #include "Version.h"
@@ -9,6 +10,7 @@
 
 #include <fstream>
 #include <iterator>
+#include <sstream>
 #include <system_error>
 #include <windows.h>
 
@@ -100,6 +102,19 @@ void WriteTextFile(const std::filesystem::path& path, const std::wstring& text) 
     }
 }
 
+void WriteUtf16LeFile(const std::filesystem::path& path, const std::wstring& text) {
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        throw std::runtime_error("failed to write update script");
+    }
+
+    const unsigned char bom[] = {0xff, 0xfe};
+    out.write(reinterpret_cast<const char*>(bom), sizeof(bom));
+    out.write(reinterpret_cast<const char*>(text.data()), static_cast<std::streamsize>(text.size() * sizeof(wchar_t)));
+}
+
 void CopyIfExists(const std::filesystem::path& source, const std::filesystem::path& target) {
     std::error_code ec;
     if (std::filesystem::is_regular_file(source, ec)) {
@@ -124,6 +139,119 @@ std::wstring QuotePowerShellLiteral(const std::filesystem::path& path) {
     }
     escaped.push_back(L'\'');
     return escaped;
+}
+
+std::wstring QuoteCommandLineArgument(const std::wstring& arg) {
+    if (arg.empty()) {
+        return L"\"\"";
+    }
+
+    const bool needsQuotes = arg.find_first_of(L" \t\n\v\"") != std::wstring::npos;
+    if (!needsQuotes) {
+        return arg;
+    }
+
+    std::wstring out = L"\"";
+    size_t backslashes = 0;
+    for (wchar_t ch : arg) {
+        if (ch == L'\\') {
+            ++backslashes;
+            continue;
+        }
+        if (ch == L'"') {
+            out.append(backslashes * 2 + 1, L'\\');
+            out.push_back(ch);
+            backslashes = 0;
+            continue;
+        }
+        out.append(backslashes, L'\\');
+        backslashes = 0;
+        out.push_back(ch);
+    }
+    out.append(backslashes * 2, L'\\');
+    out.push_back(L'"');
+    return out;
+}
+
+std::filesystem::path CurrentExecutablePath() {
+    std::wstring buffer(MAX_PATH, L'\0');
+    DWORD size = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    while (size == buffer.size()) {
+        buffer.resize(buffer.size() * 2, L'\0');
+        size = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    }
+    if (size == 0) {
+        throw std::runtime_error("failed to resolve current executable path");
+    }
+    buffer.resize(size);
+    return std::filesystem::path(buffer);
+}
+
+std::wstring BuildUpdateScript(const std::filesystem::path& sourceExe, const std::filesystem::path& targetExe) {
+    const std::filesystem::path backupExe = targetExe.wstring() + L".old";
+    std::wostringstream script;
+    script
+        << L"$ErrorActionPreference = 'Stop'\r\n"
+        << L"$source = " << QuotePowerShellLiteral(sourceExe) << L"\r\n"
+        << L"$target = " << QuotePowerShellLiteral(targetExe) << L"\r\n"
+        << L"$backup = " << QuotePowerShellLiteral(backupExe) << L"\r\n"
+        << L"for ($i = 0; $i -lt 90; $i++) {\r\n"
+        << L"    try {\r\n"
+        << L"        if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue }\r\n"
+        << L"        Move-Item -LiteralPath $target -Destination $backup -Force\r\n"
+        << L"        break\r\n"
+        << L"    } catch {\r\n"
+        << L"        Start-Sleep -Milliseconds 500\r\n"
+        << L"    }\r\n"
+        << L"}\r\n"
+        << L"if (!(Test-Path -LiteralPath $backup)) { exit 1 }\r\n"
+        << L"try {\r\n"
+        << L"    Move-Item -LiteralPath $source -Destination $target -Force\r\n"
+        << L"    Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue\r\n"
+        << L"    Start-Process -FilePath $target -WorkingDirectory (Split-Path -Parent $target)\r\n"
+        << L"} catch {\r\n"
+        << L"    if (Test-Path -LiteralPath $backup) { Move-Item -LiteralPath $backup -Destination $target -Force }\r\n"
+        << L"    exit 1\r\n"
+        << L"}\r\n"
+        << L"Start-Sleep -Seconds 2\r\n"
+        << L"Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue\r\n";
+    return script.str();
+}
+
+void LaunchDetachedPowerShellScript(const std::filesystem::path& scriptPath) {
+    std::filesystem::path powershell = L"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(powershell, ec)) {
+        powershell = L"powershell.exe";
+    }
+
+    std::wstring commandLine =
+        QuoteCommandLineArgument(powershell.wstring()) +
+        L" -NoProfile -ExecutionPolicy Bypass -File " +
+        QuoteCommandLineArgument(scriptPath.wstring());
+
+    STARTUPINFOW startup = {};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESHOWWINDOW;
+    startup.wShowWindow = SW_HIDE;
+
+    PROCESS_INFORMATION process = {};
+    if (!CreateProcessW(
+            nullptr,
+            commandLine.data(),
+            nullptr,
+            nullptr,
+            FALSE,
+            CREATE_NO_WINDOW,
+            nullptr,
+            nullptr,
+            &startup,
+            &process)) {
+        throw std::runtime_error("failed to start update helper");
+    }
+
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
 }
 
 } // namespace
@@ -336,6 +464,12 @@ bool ShouldInstallYtDlpUpdate(const ToolInstallStatus& current, const ReleaseAss
     return CompareVersions(current.version, latest.version) < 0;
 }
 
+bool ShouldInstallAppUpdate(const ReleaseAssetInfo& latest) {
+    return latest.found &&
+           !latest.version.empty() &&
+           CompareVersions(YTD_APP_VERSION_WIDE, latest.version) < 0;
+}
+
 ToolInstallStatus YtDlpManager::Status() const {
     ToolInstallStatus status;
     status.executable = m_paths.ytDlpExePath();
@@ -373,19 +507,35 @@ ToolInstallStatus YtDlpManager::InstallOrUpdate(HANDLE cancelEvent) const {
 
 ReleaseAssetInfo AppUpdateService::CheckLatestRelease() {
     const std::string json = WinHttpClient::GetString(L"https://api.github.com/repos/Laynholt/YoutubeDownloader/releases/latest");
-    return ParseGitHubReleaseAsset(json, "YoutubeDownloader_windows.zip");
+    return ParseGitHubReleaseAsset(json, "YoutubeDownloader.exe");
 }
 
-std::filesystem::path AppUpdateService::DownloadUpdateZip(
+std::filesystem::path AppUpdateService::DownloadUpdateExe(
     const AppPaths& paths,
     const ReleaseAssetInfo& release,
+    const std::function<void(std::uint64_t downloaded, std::uint64_t total)>& onProgress,
     HANDLE cancelEvent
 ) {
     if (!release.found || release.downloadUrl.empty()) {
-        throw std::runtime_error("app update release asset was not found");
+        throw std::runtime_error("app update executable was not found");
     }
 
-    const std::filesystem::path target = paths.stuffDir() / L"updates" / L"YoutubeDownloader_windows.zip";
-    WinHttpClient::DownloadFile(release.downloadUrl, target, {}, cancelEvent);
+    const std::filesystem::path target = paths.stuffDir() / L"updates" / L"YoutubeDownloader.exe.new";
+    std::error_code ec;
+    std::filesystem::remove(target, ec);
+    WinHttpClient::DownloadFile(release.downloadUrl, target, onProgress, cancelEvent);
     return target;
+}
+
+void AppUpdateService::StartDownloadedUpdate(
+    const AppPaths& paths,
+    const std::filesystem::path& downloadedExe
+) {
+    if (!IsExecutableFile(downloadedExe)) {
+        throw std::runtime_error("downloaded app update executable is missing");
+    }
+
+    const std::filesystem::path scriptPath = paths.stuffDir() / L"updates" / L"apply-app-update.ps1";
+    WriteUtf16LeFile(scriptPath, BuildUpdateScript(downloadedExe, CurrentExecutablePath()));
+    LaunchDetachedPowerShellScript(scriptPath);
 }

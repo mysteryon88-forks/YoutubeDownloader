@@ -451,7 +451,7 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         if (LOWORD(wParam) == IdSettingsButton) {
-            if (ShowSettingsDialog(m_window, m_instance, m_config) && m_paths) {
+            if (m_paths && ShowSettingsDialog(m_window, m_instance, *m_paths, m_config)) {
                 ConfigStore::Save(*m_paths, m_config);
                 m_ffmpeg = FfmpegManager::Resolve(*m_paths, m_config);
                 SetStatus(L"Настройки сохранены");

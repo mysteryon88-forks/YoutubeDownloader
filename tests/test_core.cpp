@@ -279,6 +279,41 @@ void TestFfmpegResolutionPrecedence() {
     Require(local.ffmpegExe == paths.localFfmpegExePath(), "local ffmpeg path mismatch");
 }
 
+void TestFfmpegUserPathAndExtractedTreeResolution() {
+    const fs::path root = MakeTempRoot(L"YoutubeDownloaderTests_FfmpegUserPath");
+
+    const fs::path directExe = root / L"direct" / L"ffmpeg.exe";
+    fs::create_directories(directExe.parent_path());
+    {
+        std::ofstream out(directExe);
+        out << "fake";
+    }
+    const FfmpegStatus direct = FfmpegManager::ResolveUserPath(directExe);
+    Require(direct.available, "direct ffmpeg.exe should resolve");
+    Require(direct.ffmpegExe == directExe, "direct ffmpeg.exe path mismatch");
+
+    const fs::path plainDir = root / L"plain";
+    fs::create_directories(plainDir);
+    {
+        std::ofstream out(plainDir / L"ffmpeg.exe");
+        out << "fake";
+    }
+    const FfmpegStatus plain = FfmpegManager::ResolveUserPath(plainDir);
+    Require(plain.available, "folder containing ffmpeg.exe should resolve");
+    Require(plain.ffmpegExe == plainDir / L"ffmpeg.exe", "plain folder ffmpeg path mismatch");
+
+    const fs::path extractedBin = root / L"extract" / L"ffmpeg-8.1.1-essentials_build" / L"bin";
+    fs::create_directories(extractedBin);
+    {
+        std::ofstream out(extractedBin / L"ffmpeg.exe");
+        out << "fake";
+    }
+    Require(
+        FfmpegManager::FindExtractedBinDir(root / L"extract") == extractedBin,
+        "extracted ffmpeg bin directory mismatch"
+    );
+}
+
 void TestProcessRunnerCapturesOutputAndExitCode() {
     ProcessRunOptions options;
     options.executable = L"C:\\Windows\\System32\\cmd.exe";
@@ -402,6 +437,7 @@ int main() {
     TestYtDlpProgressParsing();
     TestGitHubReleaseParsing();
     TestFfmpegResolutionPrecedence();
+    TestFfmpegUserPathAndExtractedTreeResolution();
     TestProcessRunnerCapturesOutputAndExitCode();
     TestYtDlpMetadataParsing();
     TestDownloadQueueSchedulingAndRetry();

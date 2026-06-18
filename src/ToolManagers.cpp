@@ -1,11 +1,13 @@
 #include "ToolManagers.h"
 
 #include "BackendText.h"
+#include "ProcessRunner.h"
 #include "WinHttpClient.h"
 
 #include <nlohmann/json.hpp>
 
 #include <fstream>
+#include <iterator>
 #include <system_error>
 #include <windows.h>
 
@@ -51,6 +53,12 @@ FfmpegStatus MakeFfmpegStatus(FfmpegSource source, const std::filesystem::path& 
     return status;
 }
 
+FfmpegStatus MakeMissingFfmpegStatus(const std::wstring& message) {
+    FfmpegStatus missing;
+    missing.message = message;
+    return missing;
+}
+
 std::filesystem::path SearchPathExe(const wchar_t* exeName) {
     DWORD required = SearchPathW(nullptr, exeName, nullptr, 0, nullptr, nullptr);
     if (required == 0) {
@@ -91,6 +99,32 @@ void WriteTextFile(const std::filesystem::path& path, const std::wstring& text) 
     }
 }
 
+void CopyIfExists(const std::filesystem::path& source, const std::filesystem::path& target) {
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(source, ec)) {
+        std::filesystem::copy_file(source, target, std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) {
+            throw std::runtime_error("failed to copy FFmpeg binary");
+        }
+    }
+}
+
+std::wstring QuotePowerShellLiteral(const std::filesystem::path& path) {
+    std::wstring value = path.wstring();
+    std::wstring escaped;
+    escaped.reserve(value.size() + 8);
+    escaped.push_back(L'\'');
+    for (wchar_t ch : value) {
+        if (ch == L'\'') {
+            escaped += L"''";
+        } else {
+            escaped.push_back(ch);
+        }
+    }
+    escaped.push_back(L'\'');
+    return escaped;
+}
+
 } // namespace
 
 ReleaseAssetInfo ParseGitHubReleaseAsset(const std::string& releaseJson, const std::string& assetName) {
@@ -129,8 +163,11 @@ ReleaseAssetInfo ParseGitHubReleaseAsset(const std::string& releaseJson, const s
 }
 
 FfmpegStatus FfmpegManager::Resolve(const AppPaths& paths, const AppConfig& config) {
-    if (IsExecutableFile(config.ffmpegPath)) {
-        return MakeFfmpegStatus(FfmpegSource::ConfiguredPath, config.ffmpegPath);
+    const FfmpegStatus configured = ResolveUserPath(config.ffmpegPath);
+    if (configured.available) {
+        FfmpegStatus status = configured;
+        status.source = FfmpegSource::ConfiguredPath;
+        return status;
     }
 
     if (IsExecutableFile(paths.localFfmpegExePath())) {
@@ -142,9 +179,146 @@ FfmpegStatus FfmpegManager::Resolve(const AppPaths& paths, const AppConfig& conf
         return MakeFfmpegStatus(FfmpegSource::Path, pathExe);
     }
 
-    FfmpegStatus missing;
-    missing.message = L"FFmpeg не найден";
-    return missing;
+    return MakeMissingFfmpegStatus(L"FFmpeg не найден");
+}
+
+FfmpegStatus FfmpegManager::ResolveUserPath(const std::filesystem::path& path) {
+    if (path.empty()) {
+        return MakeMissingFfmpegStatus(L"Путь FFmpeg не задан");
+    }
+
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(path, ec) && path.filename() == L"ffmpeg.exe") {
+        return MakeFfmpegStatus(FfmpegSource::ConfiguredPath, path);
+    }
+
+    if (std::filesystem::is_directory(path, ec)) {
+        const std::filesystem::path direct = path / L"ffmpeg.exe";
+        if (IsExecutableFile(direct)) {
+            return MakeFfmpegStatus(FfmpegSource::ConfiguredPath, direct);
+        }
+
+        const std::filesystem::path bin = path / L"bin" / L"ffmpeg.exe";
+        if (IsExecutableFile(bin)) {
+            return MakeFfmpegStatus(FfmpegSource::ConfiguredPath, bin);
+        }
+    }
+
+    return MakeMissingFfmpegStatus(L"В выбранном пути не найден ffmpeg.exe");
+}
+
+std::filesystem::path FfmpegManager::FindExtractedBinDir(const std::filesystem::path& extractedRoot) {
+    std::error_code ec;
+    if (!std::filesystem::is_directory(extractedRoot, ec)) {
+        return {};
+    }
+
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(extractedRoot, ec)) {
+        if (ec) {
+            break;
+        }
+        if (!entry.is_regular_file(ec)) {
+            continue;
+        }
+        if (entry.path().filename() == L"ffmpeg.exe") {
+            return entry.path().parent_path();
+        }
+    }
+    return {};
+}
+
+std::wstring FfmpegManager::EssentialsDownloadUrl() {
+    return L"https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip";
+}
+
+FfmpegStatus FfmpegManager::InstallEssentials(
+    const AppPaths& paths,
+    const std::function<void(std::uint64_t downloaded, std::uint64_t total, const std::wstring& status)>& onProgress,
+    HANDLE cancelEvent
+) {
+    const std::filesystem::path archiveTmp = paths.stuffDir() / L"ffmpeg-release-essentials.zip.tmp";
+    const std::filesystem::path archive = paths.stuffDir() / L"ffmpeg-release-essentials.zip";
+    const std::filesystem::path extractDir = paths.stuffDir() / L"ffmpeg_extract";
+
+    std::error_code ec;
+    std::filesystem::create_directories(paths.stuffDir(), ec);
+    std::filesystem::remove(archiveTmp, ec);
+    std::filesystem::remove(archive, ec);
+    std::filesystem::remove_all(extractDir, ec);
+
+    if (onProgress) {
+        onProgress(0, 0, L"Скачивание FFmpeg...");
+    }
+
+    WinHttpClient::DownloadFile(
+        EssentialsDownloadUrl(),
+        archiveTmp,
+        [onProgress](std::uint64_t downloaded, std::uint64_t total) {
+            if (onProgress) {
+                onProgress(downloaded, total, L"Скачивание FFmpeg...");
+            }
+        },
+        cancelEvent
+    );
+
+    if (cancelEvent && WaitForSingleObject(cancelEvent, 0) == WAIT_OBJECT_0) {
+        throw std::runtime_error("operation canceled");
+    }
+
+    std::filesystem::rename(archiveTmp, archive, ec);
+    if (ec) {
+        throw std::runtime_error("failed to finalize FFmpeg archive");
+    }
+
+    std::filesystem::create_directories(extractDir, ec);
+    if (onProgress) {
+        onProgress(0, 0, L"Распаковка FFmpeg...");
+    }
+
+    ProcessRunOptions options;
+    options.executable = L"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+    if (!std::filesystem::is_regular_file(options.executable, ec)) {
+        options.executable = L"powershell.exe";
+    }
+    options.arguments = {
+        L"-NoProfile",
+        L"-ExecutionPolicy",
+        L"Bypass",
+        L"-Command",
+        L"Expand-Archive -LiteralPath " + QuotePowerShellLiteral(archive) +
+            L" -DestinationPath " + QuotePowerShellLiteral(extractDir) + L" -Force"
+    };
+    options.timeoutMs = 120000;
+    options.cancelEvent = cancelEvent;
+
+    const ProcessRunResult extract = ProcessRunner::Run(options);
+    if (extract.canceled) {
+        throw std::runtime_error("operation canceled");
+    }
+    if (extract.exitCode != 0) {
+        throw std::runtime_error("failed to extract FFmpeg archive");
+    }
+
+    const std::filesystem::path extractedBin = FindExtractedBinDir(extractDir);
+    if (extractedBin.empty()) {
+        throw std::runtime_error("ffmpeg.exe was not found in extracted archive");
+    }
+
+    if (onProgress) {
+        onProgress(0, 0, L"Установка FFmpeg...");
+    }
+
+    std::filesystem::create_directories(paths.localFfmpegBinDir(), ec);
+    CopyIfExists(extractedBin / L"ffmpeg.exe", paths.localFfmpegExePath());
+    CopyIfExists(extractedBin / L"ffprobe.exe", paths.localFfprobeExePath());
+    CopyIfExists(extractedBin / L"ffplay.exe", paths.localFfplayExePath());
+
+    FfmpegStatus status = ResolveUserPath(paths.localFfmpegExePath());
+    if (!status.available) {
+        throw std::runtime_error("installed FFmpeg could not be resolved");
+    }
+    status.source = FfmpegSource::LocalTools;
+    return status;
 }
 
 YtDlpManager::YtDlpManager(AppPaths paths)

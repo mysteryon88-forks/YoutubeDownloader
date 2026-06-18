@@ -10,6 +10,7 @@
 #include "Config.h"
 
 #include <filesystem>
+#include <functional>
 #include <string>
 
 struct ReleaseAssetInfo {
@@ -40,6 +41,14 @@ struct FfmpegStatus {
 class FfmpegManager {
 public:
     static FfmpegStatus Resolve(const AppPaths& paths, const AppConfig& config);
+    static FfmpegStatus ResolveUserPath(const std::filesystem::path& path);
+    static std::filesystem::path FindExtractedBinDir(const std::filesystem::path& extractedRoot);
+    static std::wstring EssentialsDownloadUrl();
+    static FfmpegStatus InstallEssentials(
+        const AppPaths& paths,
+        const std::function<void(std::uint64_t downloaded, std::uint64_t total, const std::wstring& status)>& onProgress = {},
+        HANDLE cancelEvent = nullptr
+    );
 };
 
 struct ToolInstallStatus {

@@ -3,15 +3,23 @@
 #include "ToolManagers.h"
 #include "UiRenderer.h"
 
+#include <commctrl.h>
 #include <dwmapi.h>
 #include <gdiplus.h>
+#include <shobjidl.h>
 #include <windowsx.h>
 
 #include <algorithm>
 #include <array>
 #include <cstring>
 #include <functional>
+#include <iterator>
+#include <memory>
+#include <optional>
 #include <string>
+#include <thread>
+
+bool ShowFfmpegInstallProgress(HWND owner, HINSTANCE instance, const AppPaths& paths, AppConfig& config);
 
 namespace {
 
@@ -32,13 +40,16 @@ constexpr int kScrollTextBottomPadding = 12;
 constexpr int kScrollTextClipTopPadding = 8;
 constexpr int kScrollTextClipBottomPadding = 8;
 constexpr RECT kParallelValueRect = {458, 296, 510, 330};
+constexpr UINT kProgressUpdateMessage = WM_APP + 40;
+constexpr UINT kProgressDoneMessage = WM_APP + 41;
 
 enum class DialogType {
     Info,
     Error,
     Settings,
     About,
-    Ffmpeg
+    Ffmpeg,
+    Progress
 };
 
 enum DialogCommand {
@@ -51,6 +62,7 @@ enum DialogCommand {
     IdChoose = 14,
     IdSkip = 15,
     IdCheckUpdates = 16,
+    IdChooseFolder = 17,
     IdAutoUpdate = 120,
     IdParallelMinus = 121,
     IdParallelPlus = 122
@@ -81,9 +93,20 @@ struct DialogState {
     HWND scrollText = nullptr;
     std::wstring title;
     std::wstring message;
+    const AppPaths* paths = nullptr;
     AppConfig* config = nullptr;
     AppConfig workingConfig;
     bool* savedResult = nullptr;
+    HWND progressBar = nullptr;
+    HANDLE cancelEvent = nullptr;
+    bool progressDone = false;
+    bool progressSuccess = false;
+};
+
+struct ProgressUpdate {
+    std::uint64_t downloaded = 0;
+    std::uint64_t total = 0;
+    std::wstring status;
 };
 
 void EnableDarkTitleBar(HWND window) {
@@ -153,6 +176,74 @@ void CopyToClipboard(HWND owner, const std::wstring& text) {
         GlobalFree(memory);
     }
     CloseClipboard();
+}
+
+std::optional<std::filesystem::path> PickFfmpegExe(HWND owner) {
+    IFileOpenDialog* dialog = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog)))) {
+        return std::nullopt;
+    }
+
+    COMDLG_FILTERSPEC filters[] = {
+        {L"ffmpeg.exe", L"ffmpeg.exe"},
+        {L"Executable files", L"*.exe"}
+    };
+    dialog->SetFileTypes(static_cast<UINT>(std::size(filters)), filters);
+    dialog->SetTitle(L"Выберите ffmpeg.exe");
+
+    std::optional<std::filesystem::path> result;
+    if (SUCCEEDED(dialog->Show(owner))) {
+        IShellItem* item = nullptr;
+        if (SUCCEEDED(dialog->GetResult(&item))) {
+            PWSTR path = nullptr;
+            if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+                result = std::filesystem::path(path);
+                CoTaskMemFree(path);
+            }
+            item->Release();
+        }
+    }
+    dialog->Release();
+    return result;
+}
+
+std::optional<std::filesystem::path> PickFfmpegFolder(HWND owner) {
+    IFileOpenDialog* dialog = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog)))) {
+        return std::nullopt;
+    }
+
+    DWORD options = 0;
+    if (SUCCEEDED(dialog->GetOptions(&options))) {
+        dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+    }
+    dialog->SetTitle(L"Выберите папку FFmpeg или папку bin");
+
+    std::optional<std::filesystem::path> result;
+    if (SUCCEEDED(dialog->Show(owner))) {
+        IShellItem* item = nullptr;
+        if (SUCCEEDED(dialog->GetResult(&item))) {
+            PWSTR path = nullptr;
+            if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+                result = std::filesystem::path(path);
+                CoTaskMemFree(path);
+            }
+            item->Release();
+        }
+    }
+    dialog->Release();
+    return result;
+}
+
+bool ApplySelectedFfmpegPath(HWND owner, HINSTANCE instance, AppConfig& config, const std::filesystem::path& path) {
+    const FfmpegStatus status = FfmpegManager::ResolveUserPath(path);
+    if (!status.available) {
+        ShowErrorDialog(owner, instance, L"FFmpeg не найден", status.message);
+        return false;
+    }
+    config.ffmpegPath = status.ffmpegExe;
+    ShowInfoDialog(owner, instance, L"FFmpeg выбран", L"Используется:\n" + status.ffmpegExe.wstring());
+    return true;
 }
 
 void RegisterDialogClasses(HINSTANCE instance);
@@ -357,8 +448,8 @@ void LayoutFfmpegDialog(DialogState* state, int width, int height) {
     const int buttonY = panelBottom - kDialogButtonInset - kDialogButtonHeight;
     const int buttonLeft = panelLeft + kDialogButtonInset;
     const int availableWidth = panelRight - panelLeft - (kDialogButtonInset * 2);
-    const int buttonWidth = (availableWidth - (kDialogButtonGap * 2)) / 3;
-    const std::array<int, 3> ids = {IdInstall, IdChoose, IdSkip};
+    const int buttonWidth = (availableWidth - (kDialogButtonGap * 3)) / 4;
+    const std::array<int, 4> ids = {IdInstall, IdChoose, IdChooseFolder, IdSkip};
     int x = buttonLeft;
     for (int id : ids) {
         HWND button = GetDlgItem(state->window, id);
@@ -366,6 +457,26 @@ void LayoutFfmpegDialog(DialogState* state, int width, int height) {
             MoveWindow(button, x, buttonY, buttonWidth, kDialogButtonHeight, TRUE);
             x += buttonWidth + kDialogButtonGap;
         }
+    }
+}
+
+void LayoutProgressDialog(DialogState* state, int width, int height) {
+    const int panelRight = width - kDialogPanelInset;
+    const int panelBottom = height - kDialogPanelInset;
+    if (state->progressBar) {
+        MoveWindow(state->progressBar, 24, 118, width - 48, 24, TRUE);
+    }
+
+    HWND cancel = GetDlgItem(state->window, IdCancel);
+    if (cancel) {
+        MoveWindow(
+            cancel,
+            panelRight - kDialogButtonInset - 112,
+            panelBottom - kDialogButtonInset - kDialogButtonHeight,
+            112,
+            kDialogButtonHeight,
+            TRUE
+        );
     }
 }
 
@@ -442,6 +553,9 @@ void LayoutDialog(DialogState* state, int width, int height) {
     case DialogType::Ffmpeg:
         LayoutFfmpegDialog(state, width, height);
         break;
+    case DialogType::Progress:
+        LayoutProgressDialog(state, width, height);
+        break;
     case DialogType::Settings:
         LayoutSettingsDialog(state, width, height);
         break;
@@ -497,6 +611,22 @@ void DrawFfmpegDialog(DialogState* state, HDC dc, const RECT& client) {
     DeleteObject(textFont);
 }
 
+void DrawProgressDialog(DialogState* state, HDC dc, const RECT& client) {
+    DrawDialogBackground(dc, client);
+
+    HFONT titleFont = CreateUiFont(-18, FW_SEMIBOLD);
+    HFONT textFont = CreateUiFont(-15, FW_NORMAL);
+
+    RECT titleRect = {24, 28, client.right - 24, 58};
+    DrawTextBlock(dc, state->title, titleRect, kTextColor, titleFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    RECT statusRect = {24, 76, client.right - 24, 108};
+    DrawTextBlock(dc, state->message, statusRect, kTextColor, textFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    DeleteObject(titleFont);
+    DeleteObject(textFont);
+}
+
 void DrawSettingsDialog(DialogState* state, HDC dc, const RECT& client) {
     DrawDialogBackground(dc, client);
 
@@ -543,8 +673,67 @@ void CreateMessageControls(DialogState* state) {
 
 void CreateFfmpegControls(DialogState* state) {
     CreateDarkButton(state->window, state->instance, L"Установить", IdInstall, true);
-    CreateDarkButton(state->window, state->instance, L"Выбрать путь", IdChoose, false);
+    CreateDarkButton(state->window, state->instance, L"Выбрать exe", IdChoose, false);
+    CreateDarkButton(state->window, state->instance, L"Выбрать папку", IdChooseFolder, false);
     CreateDarkButton(state->window, state->instance, L"Пропустить", IdSkip, false);
+}
+
+void StartFfmpegInstallWorker(DialogState* state) {
+    if (!state || !state->paths || !state->config || !state->cancelEvent) {
+        return;
+    }
+
+    HWND window = state->window;
+    const AppPaths paths = *state->paths;
+    AppConfig* config = state->config;
+    HANDLE cancelEvent = state->cancelEvent;
+
+    std::thread([window, paths, config, cancelEvent]() {
+        try {
+            const FfmpegStatus status = FfmpegManager::InstallEssentials(
+                paths,
+                [window](std::uint64_t downloaded, std::uint64_t total, const std::wstring& statusText) {
+                    auto* update = new ProgressUpdate{};
+                    update->downloaded = downloaded;
+                    update->total = total;
+                    update->status = statusText;
+                    PostMessageW(window, kProgressUpdateMessage, 0, reinterpret_cast<LPARAM>(update));
+                },
+                cancelEvent
+            );
+            config->ffmpegPath = status.ffmpegExe;
+            PostMessageW(window, kProgressDoneMessage, TRUE, 0);
+        } catch (const std::exception& ex) {
+            auto* error = new std::wstring(ex.what(), ex.what() + std::strlen(ex.what()));
+            PostMessageW(window, kProgressDoneMessage, FALSE, reinterpret_cast<LPARAM>(error));
+        } catch (...) {
+            auto* error = new std::wstring(L"Неизвестная ошибка установки FFmpeg");
+            PostMessageW(window, kProgressDoneMessage, FALSE, reinterpret_cast<LPARAM>(error));
+        }
+    }).detach();
+}
+
+void CreateProgressControls(DialogState* state) {
+    state->progressBar = CreateWindowExW(
+        0,
+        PROGRESS_CLASSW,
+        L"",
+        WS_CHILD | WS_VISIBLE,
+        0,
+        0,
+        10,
+        10,
+        state->window,
+        nullptr,
+        state->instance,
+        nullptr
+    );
+    if (state->progressBar) {
+        SendMessageW(state->progressBar, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
+        SendMessageW(state->progressBar, PBM_SETPOS, 0, 0);
+    }
+    CreateDarkButton(state->window, state->instance, L"Отмена", IdCancel, false);
+    StartFfmpegInstallWorker(state);
 }
 
 void CreateSettingsControls(DialogState* state) {
@@ -644,6 +833,8 @@ LRESULT CALLBACK DialogWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
                 CreateSettingsControls(state);
             } else if (state->type == DialogType::Ffmpeg) {
                 CreateFfmpegControls(state);
+            } else if (state->type == DialogType::Progress) {
+                CreateProgressControls(state);
             } else {
                 CreateMessageControls(state);
             }
@@ -669,6 +860,8 @@ LRESULT CALLBACK DialogWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
                     DrawSettingsDialog(state, dc, client);
                 } else if (state->type == DialogType::Ffmpeg) {
                     DrawFfmpegDialog(state, dc, client);
+                } else if (state->type == DialogType::Progress) {
+                    DrawProgressDialog(state, dc, client);
                 } else {
                     DrawMessageDialog(state, dc, client);
                 }
@@ -762,12 +955,71 @@ LRESULT CALLBACK DialogWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
                 ShowAboutDialog(window, state->instance);
                 return 0;
             case IdFfmpeg:
-                ShowFfmpegDialog(window, state->instance);
+                if (state->paths && state->config && ShowFfmpegDialog(window, state->instance, *state->paths, state->workingConfig)) {
+                    RefreshSettingsButtons(state);
+                    if (state->savedResult) {
+                        *state->savedResult = true;
+                    }
+                } else {
+                    ShowFfmpegDialog(window, state->instance);
+                }
                 return 0;
             case IdInstall:
+                if (state->type == DialogType::Ffmpeg && state->paths && state->config) {
+                    if (ShowFfmpegInstallProgress(window, state->instance, *state->paths, *state->config)) {
+                        if (state->savedResult) {
+                            *state->savedResult = true;
+                        }
+                        DestroyWindow(window);
+                    }
+                    return 0;
+                }
+                DestroyWindow(window);
+                return 0;
             case IdChoose:
+                if (state->type == DialogType::Ffmpeg && state->config) {
+                    const std::optional<std::filesystem::path> selected = PickFfmpegExe(window);
+                    if (selected && ApplySelectedFfmpegPath(window, state->instance, *state->config, *selected)) {
+                        if (state->savedResult) {
+                            *state->savedResult = true;
+                        }
+                        DestroyWindow(window);
+                    }
+                    return 0;
+                }
+                DestroyWindow(window);
+                return 0;
+            case IdChooseFolder:
+                if (state->type == DialogType::Ffmpeg && state->config) {
+                    const std::optional<std::filesystem::path> selected = PickFfmpegFolder(window);
+                    if (selected && ApplySelectedFfmpegPath(window, state->instance, *state->config, *selected)) {
+                        if (state->savedResult) {
+                            *state->savedResult = true;
+                        }
+                        DestroyWindow(window);
+                    }
+                    return 0;
+                }
+                DestroyWindow(window);
+                return 0;
             case IdSkip:
+                if (state->type == DialogType::Ffmpeg && state->config) {
+                    state->config->ffmpegPromptDismissed = true;
+                    if (state->savedResult) {
+                        *state->savedResult = true;
+                    }
+                }
+                DestroyWindow(window);
+                return 0;
             case IdCancel:
+                if (state->type == DialogType::Progress && !state->progressDone) {
+                    if (state->cancelEvent) {
+                        SetEvent(state->cancelEvent);
+                    }
+                    state->message = L"Отмена...";
+                    InvalidateRect(window, nullptr, FALSE);
+                    return 0;
+                }
                 DestroyWindow(window);
                 return 0;
             case IdOk:
@@ -785,11 +1037,48 @@ LRESULT CALLBACK DialogWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
         }
         break;
 
+    case kProgressUpdateMessage:
+        if (state && state->type == DialogType::Progress) {
+            std::unique_ptr<ProgressUpdate> update(reinterpret_cast<ProgressUpdate*>(lParam));
+            state->message = update->status;
+            if (state->progressBar && update->total > 0) {
+                const int percent = static_cast<int>((update->downloaded * 100) / update->total);
+                SendMessageW(state->progressBar, PBM_SETPOS, std::clamp(percent, 0, 100), 0);
+            }
+            InvalidateRect(window, nullptr, FALSE);
+        }
+        return 0;
+
+    case kProgressDoneMessage:
+        if (state && state->type == DialogType::Progress) {
+            state->progressDone = true;
+            state->progressSuccess = wParam == TRUE;
+            if (state->progressSuccess) {
+                state->message = L"FFmpeg установлен.";
+                if (state->progressBar) {
+                    SendMessageW(state->progressBar, PBM_SETPOS, 100, 0);
+                }
+                if (state->savedResult) {
+                    *state->savedResult = true;
+                }
+            } else {
+                std::unique_ptr<std::wstring> error(reinterpret_cast<std::wstring*>(lParam));
+                state->message = error ? *error : L"Не удалось установить FFmpeg.";
+            }
+            SetDarkButtonState(window, IdCancel, state->progressSuccess, L"OK");
+            InvalidateRect(window, nullptr, FALSE);
+        }
+        return 0;
+
     case WM_CLOSE:
         DestroyWindow(window);
         return 0;
 
     case WM_NCDESTROY:
+        if (state && state->cancelEvent) {
+            CloseHandle(state->cancelEvent);
+            state->cancelEvent = nullptr;
+        }
         delete state;
         SetWindowLongPtrW(window, GWLP_USERDATA, 0);
         return 0;
@@ -1094,11 +1383,17 @@ void ShowSettingsDialog(HWND owner, HINSTANCE instance) {
 }
 
 bool ShowSettingsDialog(HWND owner, HINSTANCE instance, AppConfig& config) {
+    AppPaths emptyPaths(std::filesystem::path{});
+    return ShowSettingsDialog(owner, instance, emptyPaths, config);
+}
+
+bool ShowSettingsDialog(HWND owner, HINSTANCE instance, const AppPaths& paths, AppConfig& config) {
     auto* state = new DialogState{};
     state->type = DialogType::Settings;
     state->instance = instance;
     state->owner = owner;
     state->title = L"Настройки";
+    state->paths = paths.root().empty() ? nullptr : &paths;
     state->config = &config;
     state->workingConfig = config;
     bool saved = false;
@@ -1121,10 +1416,37 @@ void ShowAboutDialog(HWND owner, HINSTANCE instance) {
 }
 
 void ShowFfmpegDialog(HWND owner, HINSTANCE instance) {
+    AppConfig ignored;
+    AppPaths emptyPaths(std::filesystem::path{});
+    ShowFfmpegDialog(owner, instance, emptyPaths, ignored);
+}
+
+bool ShowFfmpegDialog(HWND owner, HINSTANCE instance, const AppPaths& paths, AppConfig& config) {
     auto* state = new DialogState{};
     state->type = DialogType::Ffmpeg;
     state->instance = instance;
     state->owner = owner;
     state->title = L"FFmpeg не найден";
+    state->paths = paths.root().empty() ? nullptr : &paths;
+    state->config = &config;
+    bool saved = false;
+    state->savedResult = &saved;
     ShowModal(state, 600, 370);
+    return saved;
+}
+
+bool ShowFfmpegInstallProgress(HWND owner, HINSTANCE instance, const AppPaths& paths, AppConfig& config) {
+    auto* state = new DialogState{};
+    state->type = DialogType::Progress;
+    state->instance = instance;
+    state->owner = owner;
+    state->title = L"Установка FFmpeg";
+    state->message = L"Подготовка...";
+    state->paths = &paths;
+    state->config = &config;
+    state->cancelEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    bool saved = false;
+    state->savedResult = &saved;
+    ShowModal(state, 560, 230);
+    return saved;
 }

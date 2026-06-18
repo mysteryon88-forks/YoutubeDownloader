@@ -5,7 +5,14 @@
 #include <string>
 #include <vector>
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#include <windows.h>
+
 struct YtDlpDownloadRequest {
+    std::filesystem::path ytDlpExePath;
     std::wstring url;
     std::filesystem::path outputDirectory;
     std::filesystem::path cookiesPath;
@@ -26,5 +33,36 @@ struct YtDlpProgress {
     std::uint64_t etaSeconds = 0;
 };
 
+struct VideoPreview {
+    std::wstring id;
+    std::wstring title;
+    std::wstring uploader;
+    std::uint64_t durationSeconds = 0;
+    std::wstring thumbnailUrl;
+    std::wstring webpageUrl;
+    bool isPlaylist = false;
+    std::vector<VideoPreview> entries;
+    std::filesystem::path cachedThumbnailPath;
+};
+
+struct YtDlpClientOptions {
+    std::filesystem::path ytDlpExePath;
+    std::filesystem::path thumbCacheDir;
+    std::filesystem::path cookiesPath;
+};
+
 std::vector<std::wstring> BuildDownloadArguments(const YtDlpDownloadRequest& request);
 YtDlpProgress ParseYtDlpProgressLine(const std::wstring& line);
+VideoPreview ParseVideoPreviewJson(const std::string& jsonText);
+
+class YtDlpClient {
+public:
+    explicit YtDlpClient(YtDlpClientOptions options);
+
+    VideoPreview FetchPreview(const std::wstring& url, HANDLE cancelEvent = nullptr) const;
+    VideoPreview ExpandPlaylist(const std::wstring& url, HANDLE cancelEvent = nullptr) const;
+    std::filesystem::path CacheThumbnail(const VideoPreview& preview, HANDLE cancelEvent = nullptr) const;
+
+private:
+    YtDlpClientOptions m_options;
+};

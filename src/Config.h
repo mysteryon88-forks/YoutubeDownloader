@@ -12,7 +12,7 @@ struct AppConfig {
     std::wstring quality = L"max";
     std::wstring container = L"auto";
     int maxParallelDownloads = 3;
-    bool autoUpdateApp = false;
+    bool autoUpdateApp = true;
     std::wstring lastYtDlpCheckAt;
     std::wstring lastYtDlpVersion;
     bool ffmpegPromptDismissed = false;

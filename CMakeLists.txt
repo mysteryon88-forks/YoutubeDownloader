@@ -16,17 +16,27 @@ endif()
 
 set(CORE_SOURCES
     src/AppPaths.cpp
+    src/BackendText.cpp
     src/Config.cpp
+    src/DownloadQueue.cpp
+    src/Logger.cpp
+    src/ProcessRunner.cpp
     src/ToolManagers.cpp
     src/Version.cpp
+    src/WinHttpClient.cpp
     src/YtDlpClient.cpp
 )
 
 set(CORE_HEADERS
     src/AppPaths.h
+    src/BackendText.h
     src/Config.h
+    src/DownloadQueue.h
+    src/Logger.h
+    src/ProcessRunner.h
     src/ToolManagers.h
     src/Version.h
+    src/WinHttpClient.h
     src/YtDlpClient.h
 )
 
@@ -43,6 +53,10 @@ target_include_directories(YoutubeDownloaderCore PUBLIC
 if(MSVC)
     target_compile_options(YoutubeDownloaderCore PRIVATE /W4 /permissive- /utf-8)
 endif()
+
+target_link_libraries(YoutubeDownloaderCore PUBLIC
+    winhttp
+)
 
 add_executable(YoutubeDownloader WIN32
     src/main.cpp

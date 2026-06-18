@@ -1,41 +1,18 @@
 #include "Config.h"
 
+#include "BackendText.h"
+
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstdlib>
 #include <fstream>
 #include <system_error>
 
 namespace {
 
-std::string WideToUtf8(const std::wstring& value) {
-    if (value.empty()) {
-        return {};
-    }
-
-    std::string out;
-    for (wchar_t ch : value) {
-        if (ch >= 0 && ch <= 0x7f) {
-            out.push_back(static_cast<char>(ch));
-        } else {
-            // The first slice is Windows-only and currently persists ordinary paths used by tests.
-            out.push_back('?');
-        }
-    }
-    return out;
-}
-
-std::wstring Utf8ToWide(const std::string& value) {
-    std::wstring out;
-    out.reserve(value.size());
-    for (unsigned char ch : value) {
-        out.push_back(static_cast<wchar_t>(ch));
-    }
-    return out;
-}
-
 std::string PathToJsonString(const std::filesystem::path& path) {
-    return WideToUtf8(path.wstring());
+    return PathToUtf8(path);
 }
 
 std::filesystem::path PathFromJsonString(const nlohmann::json& json, const char* key, const std::filesystem::path& fallback = {}) {
@@ -43,7 +20,7 @@ std::filesystem::path PathFromJsonString(const nlohmann::json& json, const char*
     if (it == json.end() || !it->is_string()) {
         return fallback;
     }
-    return std::filesystem::path(Utf8ToWide(it->get<std::string>()));
+    return PathFromUtf8(it->get<std::string>());
 }
 
 std::wstring WStringFromJson(const nlohmann::json& json, const char* key, const std::wstring& fallback = L"") {
@@ -110,9 +87,7 @@ AppConfig ConfigStore::Load(const AppPaths& paths) {
         config.quality = WStringFromJson(json, "quality", config.quality);
         config.container = WStringFromJson(json, "container", config.container);
         config.maxParallelDownloads = IntFromJson(json, "max_parallel_downloads", config.maxParallelDownloads);
-        if (config.maxParallelDownloads < 1) {
-            config.maxParallelDownloads = 1;
-        }
+        config.maxParallelDownloads = std::clamp(config.maxParallelDownloads, 3, 10);
         config.autoUpdateApp = BoolFromJson(json, "auto_update_app", config.autoUpdateApp);
         config.lastYtDlpCheckAt = WStringFromJson(json, "last_ytdlp_check_at", config.lastYtDlpCheckAt);
         config.lastYtDlpVersion = WStringFromJson(json, "last_ytdlp_version", config.lastYtDlpVersion);

@@ -1,14 +1,20 @@
 #include "AppPaths.h"
+#include "BackendText.h"
 #include "Config.h"
+#include "DownloadQueue.h"
+#include "ProcessRunner.h"
 #include "ToolManagers.h"
 #include "Version.h"
 #include "YtDlpClient.h"
 
+#include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <ranges>
 #include <string>
+#include <thread>
 #include <system_error>
 
 namespace fs = std::filesystem;
@@ -58,7 +64,7 @@ void TestConfigDefaultsAndRoundTrip() {
     Require(defaults.quality == L"max", "default quality mismatch");
     Require(defaults.container == L"auto", "default container mismatch");
     Require(defaults.maxParallelDownloads == 3, "default max parallel mismatch");
-    Require(defaults.autoUpdateApp == false, "default app auto update mismatch");
+    Require(defaults.autoUpdateApp == true, "default app auto update mismatch");
     Require(defaults.ffmpegPromptDismissed == false, "default ffmpeg prompt mismatch");
     Require(!defaults.downloadDir.empty(), "default download dir is empty");
 
@@ -88,6 +94,47 @@ void TestConfigDefaultsAndRoundTrip() {
     Require(loaded.lastYtDlpCheckAt == L"2026-06-17T20:00:00Z", "yt-dlp check timestamp mismatch");
     Require(loaded.lastYtDlpVersion == L"2026.06.09", "yt-dlp version mismatch");
     Require(loaded.ffmpegPromptDismissed == true, "ffmpeg prompt round-trip mismatch");
+}
+
+void TestConfigParallelDownloadBounds() {
+    const fs::path root = MakeTempRoot(L"YoutubeDownloaderTests_ConfigBounds");
+    const AppPaths paths(root);
+
+    {
+        fs::create_directories(paths.configPath().parent_path());
+        std::ofstream out(paths.configPath());
+        out << R"json({"max_parallel_downloads": 1})json";
+    }
+    Require(ConfigStore::Load(paths).maxParallelDownloads == 3, "parallel downloads should clamp to minimum 3");
+
+    {
+        std::ofstream out(paths.configPath(), std::ios::trunc);
+        out << R"json({"max_parallel_downloads": 99})json";
+    }
+    Require(ConfigStore::Load(paths).maxParallelDownloads == 10, "parallel downloads should clamp to maximum 10");
+}
+
+void TestConfigUtf8RoundTrip() {
+    const fs::path root = MakeTempRoot(L"YoutubeDownloaderTests_ConfigUtf8");
+    const AppPaths paths(root);
+
+    AppConfig saved = ConfigStore::Load(paths);
+    saved.downloadDir = root / L"Загрузки";
+    saved.cookiesPath = root / L"куки.txt";
+    saved.ffmpegPath = root / L"инструменты" / L"ffmpeg.exe";
+    saved.quality = L"1080p";
+    saved.container = L"mkv";
+    saved.lastYtDlpVersion = L"2026.06.17";
+
+    ConfigStore::Save(paths, saved);
+    const AppConfig loaded = ConfigStore::Load(paths);
+
+    Require(loaded.downloadDir == saved.downloadDir, "utf8 download dir round-trip mismatch");
+    Require(loaded.cookiesPath == saved.cookiesPath, "utf8 cookies path round-trip mismatch");
+    Require(loaded.ffmpegPath == saved.ffmpegPath, "utf8 ffmpeg path round-trip mismatch");
+    Require(loaded.quality == L"1080p", "utf8 quality round-trip mismatch");
+    Require(loaded.container == L"mkv", "utf8 container round-trip mismatch");
+    Require(loaded.lastYtDlpVersion == L"2026.06.17", "utf8 version round-trip mismatch");
 }
 
 void TestVersionCompare() {
@@ -202,14 +249,161 @@ void TestGitHubReleaseParsing() {
     Require(!missing.found, "missing asset should not be found");
 }
 
+void TestFfmpegResolutionPrecedence() {
+    const fs::path root = MakeTempRoot(L"YoutubeDownloaderTests_Ffmpeg");
+    const AppPaths paths(root);
+
+    AppConfig config;
+    config.ffmpegPath = root / L"chosen" / L"ffmpeg.exe";
+    fs::create_directories(config.ffmpegPath.parent_path());
+    {
+        std::ofstream out(config.ffmpegPath);
+        out << "fake";
+    }
+
+    fs::create_directories(paths.localFfmpegBinDir());
+    {
+        std::ofstream out(paths.localFfmpegExePath());
+        out << "local fake";
+    }
+
+    const FfmpegStatus chosen = FfmpegManager::Resolve(paths, config);
+    Require(chosen.available, "saved ffmpeg path should resolve");
+    Require(chosen.source == FfmpegSource::ConfiguredPath, "saved ffmpeg path should take precedence");
+    Require(chosen.ffmpegExe == config.ffmpegPath, "configured ffmpeg path mismatch");
+
+    config.ffmpegPath.clear();
+    const FfmpegStatus local = FfmpegManager::Resolve(paths, config);
+    Require(local.available, "local ffmpeg path should resolve");
+    Require(local.source == FfmpegSource::LocalTools, "local ffmpeg source mismatch");
+    Require(local.ffmpegExe == paths.localFfmpegExePath(), "local ffmpeg path mismatch");
+}
+
+void TestProcessRunnerCapturesOutputAndExitCode() {
+    ProcessRunOptions options;
+    options.executable = L"C:\\Windows\\System32\\cmd.exe";
+    options.arguments = {L"/C", L"echo stdout-line && echo stderr-line 1>&2 && exit /b 7"};
+    options.timeoutMs = 5000;
+
+    const ProcessRunResult result = ProcessRunner::Run(options);
+
+    Require(!result.timedOut, "process should not time out");
+    Require(!result.canceled, "process should not be canceled");
+    Require(result.exitCode == 7, "process exit code mismatch");
+    Require(result.stdoutText.find(L"stdout-line") != std::wstring::npos, "stdout was not captured");
+    Require(result.stderrText.find(L"stderr-line") != std::wstring::npos, "stderr was not captured");
+}
+
+void TestYtDlpMetadataParsing() {
+    const std::string videoJson = R"json(
+{
+  "id": "abc123",
+  "title": "Example Video",
+  "uploader": "Example Channel",
+  "duration": 125,
+  "thumbnail": "https://example.invalid/thumb.jpg",
+  "webpage_url": "https://www.youtube.com/watch?v=abc123"
+}
+)json";
+
+    const VideoPreview video = ParseVideoPreviewJson(videoJson);
+    Require(video.id == L"abc123", "video id mismatch");
+    Require(video.title == L"Example Video", "video title mismatch");
+    Require(video.uploader == L"Example Channel", "video uploader mismatch");
+    Require(video.durationSeconds == 125, "video duration mismatch");
+    Require(video.thumbnailUrl == L"https://example.invalid/thumb.jpg", "video thumbnail mismatch");
+    Require(!video.isPlaylist, "single video should not be playlist");
+
+    const std::string playlistJson = R"json(
+{
+  "id": "playlist1",
+  "title": "Example Playlist",
+  "_type": "playlist",
+  "webpage_url": "https://www.youtube.com/playlist?list=playlist1",
+  "entries": [
+    {"id": "v1", "title": "Video One", "url": "https://www.youtube.com/watch?v=v1", "duration": 10},
+    {"id": "v2", "title": "Video Two", "webpage_url": "https://www.youtube.com/watch?v=v2", "duration": 20}
+  ]
+}
+)json";
+
+    const VideoPreview playlist = ParseVideoPreviewJson(playlistJson);
+    Require(playlist.isPlaylist, "playlist should be marked as playlist");
+    Require(playlist.entries.size() == 2, "playlist entry count mismatch");
+    Require(playlist.entries[0].id == L"v1", "playlist first entry id mismatch");
+    Require(playlist.entries[0].webpageUrl == L"https://www.youtube.com/watch?v=v1", "playlist first entry url mismatch");
+    Require(playlist.entries[1].title == L"Video Two", "playlist second entry title mismatch");
+}
+
+void TestDownloadQueueSchedulingAndRetry() {
+    std::atomic<int> running = 0;
+    std::atomic<int> maxRunning = 0;
+    std::atomic<int> attempts = 0;
+
+    DownloadQueue queue(2);
+    queue.SetExecutor([&](const DownloadTaskSnapshot& task, const DownloadTaskCallbacks& callbacks) {
+        UNREFERENCED_PARAMETER(task);
+        const int now = ++running;
+        int observed = maxRunning.load();
+        while (now > observed && !maxRunning.compare_exchange_weak(observed, now)) {
+        }
+        callbacks.onProgress(25.0, L"running");
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        --running;
+        ++attempts;
+        return DownloadTaskResult{true, L"", {}};
+    });
+
+    YtDlpDownloadRequest request;
+    request.url = L"https://example.invalid/video";
+    request.outputDirectory = fs::temp_directory_path();
+
+    const int first = queue.Enqueue(request, L"First");
+    const int second = queue.Enqueue(request, L"Second");
+    const int third = queue.Enqueue(request, L"Third");
+
+    queue.WaitForIdle();
+    Require(maxRunning.load() <= 2, "queue exceeded max parallel downloads");
+    Require(queue.GetTask(first).state == DownloadTaskState::Completed, "first task should complete");
+    Require(queue.GetTask(second).state == DownloadTaskState::Completed, "second task should complete");
+    Require(queue.GetTask(third).state == DownloadTaskState::Completed, "third task should complete");
+
+    queue.SetExecutor([&](const DownloadTaskSnapshot& task, const DownloadTaskCallbacks& callbacks) {
+        UNREFERENCED_PARAMETER(task);
+        UNREFERENCED_PARAMETER(callbacks);
+        ++attempts;
+        return DownloadTaskResult{false, L"planned failure", {}};
+    });
+    const int failing = queue.Enqueue(request, L"Failing");
+    queue.WaitForIdle();
+    Require(queue.GetTask(failing).state == DownloadTaskState::Failed, "failing task should fail");
+
+    queue.SetExecutor([&](const DownloadTaskSnapshot& task, const DownloadTaskCallbacks& callbacks) {
+        UNREFERENCED_PARAMETER(task);
+        callbacks.onProgress(100.0, L"retry complete");
+        ++attempts;
+        return DownloadTaskResult{true, L"", {}};
+    });
+    Require(queue.Retry(failing), "retry should be accepted for failed task");
+    queue.WaitForIdle();
+    Require(queue.GetTask(failing).state == DownloadTaskState::Completed, "retried task should complete");
+    Require(attempts.load() >= 5, "executor attempt count mismatch");
+}
+
 } // namespace
 
 int main() {
     TestAppPaths();
     TestConfigDefaultsAndRoundTrip();
+    TestConfigParallelDownloadBounds();
+    TestConfigUtf8RoundTrip();
     TestVersionCompare();
     TestYtDlpDownloadArguments();
     TestYtDlpProgressParsing();
     TestGitHubReleaseParsing();
+    TestFfmpegResolutionPrecedence();
+    TestProcessRunnerCapturesOutputAndExitCode();
+    TestYtDlpMetadataParsing();
+    TestDownloadQueueSchedulingAndRetry();
     return 0;
 }

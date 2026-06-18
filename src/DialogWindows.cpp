@@ -1,5 +1,6 @@
 #include "DialogWindows.h"
 
+#include "ToolManagers.h"
 #include "UiRenderer.h"
 
 #include <dwmapi.h>
@@ -9,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <functional>
 #include <string>
 
 namespace {
@@ -29,6 +31,7 @@ constexpr int kScrollTextTopPadding = 12;
 constexpr int kScrollTextBottomPadding = 12;
 constexpr int kScrollTextClipTopPadding = 8;
 constexpr int kScrollTextClipBottomPadding = 8;
+constexpr RECT kParallelValueRect = {458, 296, 510, 330};
 
 enum class DialogType {
     Info,
@@ -46,7 +49,11 @@ enum DialogCommand {
     IdFfmpeg = 12,
     IdInstall = 13,
     IdChoose = 14,
-    IdSkip = 15
+    IdSkip = 15,
+    IdCheckUpdates = 16,
+    IdAutoUpdate = 120,
+    IdParallelMinus = 121,
+    IdParallelPlus = 122
 };
 
 struct ButtonState {
@@ -74,6 +81,9 @@ struct DialogState {
     HWND scrollText = nullptr;
     std::wstring title;
     std::wstring message;
+    AppConfig* config = nullptr;
+    AppConfig workingConfig;
+    bool* savedResult = nullptr;
 };
 
 void EnableDarkTitleBar(HWND window) {
@@ -99,6 +109,28 @@ void DrawTextBlock(HDC dc, const std::wstring& text, RECT rect, COLORREF color, 
     SetTextColor(dc, color);
     DrawTextW(dc, text.c_str(), -1, &rect, format | DT_NOPREFIX);
     SelectObject(dc, oldFont);
+}
+
+void PaintBuffered(HWND window, const std::function<void(HDC, const RECT&)>& paintContent) {
+    PAINTSTRUCT paint = {};
+    HDC screenDc = BeginPaint(window, &paint);
+
+    RECT client = {};
+    GetClientRect(window, &client);
+    const int width = std::max(1, static_cast<int>(client.right - client.left));
+    const int height = std::max(1, static_cast<int>(client.bottom - client.top));
+
+    HDC bufferDc = CreateCompatibleDC(screenDc);
+    HBITMAP bitmap = CreateCompatibleBitmap(screenDc, width, height);
+    HGDIOBJ oldBitmap = SelectObject(bufferDc, bitmap);
+
+    paintContent(bufferDc, client);
+    BitBlt(screenDc, 0, 0, width, height, bufferDc, 0, 0, SRCCOPY);
+
+    SelectObject(bufferDc, oldBitmap);
+    DeleteObject(bitmap);
+    DeleteDC(bufferDc);
+    EndPaint(window, &paint);
 }
 
 void CopyToClipboard(HWND owner, const std::wstring& text) {
@@ -152,6 +184,51 @@ HWND CreateDarkButton(HWND parent, HINSTANCE instance, const wchar_t* text, int 
         delete state;
     }
     return button;
+}
+
+ButtonState* GetButtonState(HWND button) {
+    return reinterpret_cast<ButtonState*>(GetWindowLongPtrW(button, GWLP_USERDATA));
+}
+
+void SetDarkButtonState(HWND parent, int id, bool primary, const std::wstring& text = L"") {
+    HWND button = GetDlgItem(parent, id);
+    if (!button) {
+        return;
+    }
+    ButtonState* state = GetButtonState(button);
+    if (!state) {
+        return;
+    }
+    state->primary = primary;
+    if (!text.empty()) {
+        state->text = text;
+    }
+    InvalidateRect(button, nullptr, TRUE);
+}
+
+void RefreshSettingsButtons(DialogState* state) {
+    if (!state || !state->window) {
+        return;
+    }
+
+    SetDarkButtonState(state->window, 101, state->workingConfig.quality == L"audio");
+    SetDarkButtonState(state->window, 102, state->workingConfig.quality == L"360p");
+    SetDarkButtonState(state->window, 103, state->workingConfig.quality == L"480p");
+    SetDarkButtonState(state->window, 104, state->workingConfig.quality == L"720p");
+    SetDarkButtonState(state->window, 105, state->workingConfig.quality == L"1080p");
+    SetDarkButtonState(state->window, 106, state->workingConfig.quality == L"max");
+
+    SetDarkButtonState(state->window, 111, state->workingConfig.container == L"auto");
+    SetDarkButtonState(state->window, 112, state->workingConfig.container == L"mp4");
+    SetDarkButtonState(state->window, 113, state->workingConfig.container == L"mkv");
+    SetDarkButtonState(state->window, 114, state->workingConfig.container == L"webm");
+
+    SetDarkButtonState(
+        state->window,
+        IdAutoUpdate,
+        state->workingConfig.autoUpdateApp,
+        state->workingConfig.autoUpdateApp ? L"Автопроверка: Вкл" : L"Автопроверка: Выкл"
+    );
 }
 
 HWND CreateScrollText(HWND parent, HINSTANCE instance, const std::wstring& text) {
@@ -254,6 +331,10 @@ void LayoutMessageDialog(DialogState* state, int width, int height) {
     const int buttonY = panelBottom - kDialogButtonInset - kDialogButtonHeight;
     HWND copyButton = GetDlgItem(state->window, IdCopy);
     HWND okButton = GetDlgItem(state->window, IdOk);
+    HWND updateButton = GetDlgItem(state->window, IdCheckUpdates);
+    if (updateButton) {
+        MoveWindow(updateButton, kDialogPanelInset + kDialogButtonInset, buttonY, 190, kDialogButtonHeight, TRUE);
+    }
     if (copyButton) {
         MoveWindow(
             copyButton,
@@ -313,13 +394,25 @@ void LayoutSettingsDialog(DialogState* state, int width, int height) {
 
     HWND ffmpeg = GetDlgItem(state->window, IdFfmpeg);
     HWND about = GetDlgItem(state->window, IdAbout);
+    HWND autoUpdate = GetDlgItem(state->window, IdAutoUpdate);
+    HWND parallelMinus = GetDlgItem(state->window, IdParallelMinus);
+    HWND parallelPlus = GetDlgItem(state->window, IdParallelPlus);
     HWND cancel = GetDlgItem(state->window, IdCancel);
     HWND ok = GetDlgItem(state->window, IdOk);
+    if (autoUpdate) {
+        MoveWindow(autoUpdate, 24, 296, 190, 34, TRUE);
+    }
+    if (parallelMinus) {
+        MoveWindow(parallelMinus, 414, 296, 34, 34, TRUE);
+    }
+    if (parallelPlus) {
+        MoveWindow(parallelPlus, 520, 296, 34, 34, TRUE);
+    }
     if (ffmpeg) {
-        MoveWindow(ffmpeg, 24, 328, 178, 34, TRUE);
+        MoveWindow(ffmpeg, 24, 358, 178, 34, TRUE);
     }
     if (about) {
-        MoveWindow(about, 214, 328, 150, 34, TRUE);
+        MoveWindow(about, 214, 358, 150, 34, TRUE);
     }
     const int panelRight = width - kDialogPanelInset;
     const int panelBottom = height - kDialogPanelInset;
@@ -424,23 +517,14 @@ void DrawSettingsDialog(DialogState* state, HDC dc, const RECT& client) {
     DrawTextBlock(dc, L"Поведение", behaviorLabel, kTextColor, labelFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
     RECT behaviorText = {24, 292, client.right - 24, 318};
+    DrawTextBlock(dc, L"Параллельные загрузки", {238, 296, 410, 330}, kTextColor, textFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     DrawTextBlock(
         dc,
-        L"Автопроверка обновлений включена. Максимум параллельных загрузок: 3.",
-        behaviorText,
-        kMutedTextColor,
-        textFont,
-        DT_LEFT | DT_VCENTER | DT_SINGLELINE
-    );
-
-    RECT noteRect = {24, 382, client.right - 24, 424};
-    DrawTextBlock(
-        dc,
-        L"Это UI-заготовка настроек. Следующим слоем сюда будет подключен ConfigStore и реальные действия yt-dlp/FFmpeg.",
-        noteRect,
-        kMutedTextColor,
-        textFont,
-        DT_LEFT | DT_WORDBREAK
+        std::to_wstring(state->workingConfig.maxParallelDownloads),
+        kParallelValueRect,
+        kTextColor,
+        labelFont,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE
     );
 
     DeleteObject(titleFont);
@@ -450,6 +534,9 @@ void DrawSettingsDialog(DialogState* state, HDC dc, const RECT& client) {
 
 void CreateMessageControls(DialogState* state) {
     state->scrollText = CreateScrollText(state->window, state->instance, state->message);
+    if (state->type == DialogType::About) {
+        CreateDarkButton(state->window, state->instance, L"Проверить обновление", IdCheckUpdates, false);
+    }
     CreateDarkButton(state->window, state->instance, L"Скопировать", IdCopy, false);
     CreateDarkButton(state->window, state->instance, L"OK", IdOk, true);
 }
@@ -470,7 +557,14 @@ void CreateSettingsControls(DialogState* state) {
         {106, L"Макс."}
     }};
     for (const auto& [id, text] : qualityButtons) {
-        CreateDarkButton(state->window, state->instance, text, id, id == 105);
+        const bool selected =
+            (id == 101 && state->workingConfig.quality == L"audio") ||
+            (id == 102 && state->workingConfig.quality == L"360p") ||
+            (id == 103 && state->workingConfig.quality == L"480p") ||
+            (id == 104 && state->workingConfig.quality == L"720p") ||
+            (id == 105 && state->workingConfig.quality == L"1080p") ||
+            (id == 106 && state->workingConfig.quality == L"max");
+        CreateDarkButton(state->window, state->instance, text, id, selected);
     }
 
     const std::array<std::pair<int, const wchar_t*>, 4> containerButtons = {{
@@ -480,10 +574,24 @@ void CreateSettingsControls(DialogState* state) {
         {114, L"WEBM"}
     }};
     for (const auto& [id, text] : containerButtons) {
-        CreateDarkButton(state->window, state->instance, text, id, id == 111);
+        const bool selected =
+            (id == 111 && state->workingConfig.container == L"auto") ||
+            (id == 112 && state->workingConfig.container == L"mp4") ||
+            (id == 113 && state->workingConfig.container == L"mkv") ||
+            (id == 114 && state->workingConfig.container == L"webm");
+        CreateDarkButton(state->window, state->instance, text, id, selected);
     }
 
     CreateDarkButton(state->window, state->instance, L"FFmpeg", IdFfmpeg, false);
+    CreateDarkButton(
+        state->window,
+        state->instance,
+        state->workingConfig.autoUpdateApp ? L"Автопроверка: Вкл" : L"Автопроверка: Выкл",
+        IdAutoUpdate,
+        state->workingConfig.autoUpdateApp
+    );
+    CreateDarkButton(state->window, state->instance, L"-", IdParallelMinus, false);
+    CreateDarkButton(state->window, state->instance, L"+", IdParallelPlus, false);
     CreateDarkButton(state->window, state->instance, L"О программе", IdAbout, false);
     CreateDarkButton(state->window, state->instance, L"Отмена", IdCancel, false);
     CreateDarkButton(state->window, state->instance, L"Сохранить", IdOk, true);
@@ -556,26 +664,99 @@ LRESULT CALLBACK DialogWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
 
     case WM_PAINT:
         if (state) {
-            PAINTSTRUCT paint = {};
-            HDC dc = BeginPaint(window, &paint);
-            RECT client = {};
-            GetClientRect(window, &client);
-            if (state->type == DialogType::Settings) {
-                DrawSettingsDialog(state, dc, client);
-            } else if (state->type == DialogType::Ffmpeg) {
-                DrawFfmpegDialog(state, dc, client);
-            } else {
-                DrawMessageDialog(state, dc, client);
-            }
-            EndPaint(window, &paint);
+            PaintBuffered(window, [state](HDC dc, const RECT& client) {
+                if (state->type == DialogType::Settings) {
+                    DrawSettingsDialog(state, dc, client);
+                } else if (state->type == DialogType::Ffmpeg) {
+                    DrawFfmpegDialog(state, dc, client);
+                } else {
+                    DrawMessageDialog(state, dc, client);
+                }
+            });
         }
         return 0;
 
     case WM_COMMAND:
         if (state) {
             switch (LOWORD(wParam)) {
+            case 101:
+                state->workingConfig.quality = L"audio";
+                RefreshSettingsButtons(state);
+                return 0;
+            case 102:
+                state->workingConfig.quality = L"360p";
+                RefreshSettingsButtons(state);
+                return 0;
+            case 103:
+                state->workingConfig.quality = L"480p";
+                RefreshSettingsButtons(state);
+                return 0;
+            case 104:
+                state->workingConfig.quality = L"720p";
+                RefreshSettingsButtons(state);
+                return 0;
+            case 105:
+                state->workingConfig.quality = L"1080p";
+                RefreshSettingsButtons(state);
+                return 0;
+            case 106:
+                state->workingConfig.quality = L"max";
+                RefreshSettingsButtons(state);
+                return 0;
+            case 111:
+                state->workingConfig.container = L"auto";
+                RefreshSettingsButtons(state);
+                return 0;
+            case 112:
+                state->workingConfig.container = L"mp4";
+                RefreshSettingsButtons(state);
+                return 0;
+            case 113:
+                state->workingConfig.container = L"mkv";
+                RefreshSettingsButtons(state);
+                return 0;
+            case 114:
+                state->workingConfig.container = L"webm";
+                RefreshSettingsButtons(state);
+                return 0;
+            case IdAutoUpdate:
+                state->workingConfig.autoUpdateApp = !state->workingConfig.autoUpdateApp;
+                RefreshSettingsButtons(state);
+                return 0;
+            case IdParallelMinus:
+                state->workingConfig.maxParallelDownloads = std::clamp(state->workingConfig.maxParallelDownloads - 1, 3, 10);
+                RefreshSettingsButtons(state);
+                InvalidateRect(state->window, &kParallelValueRect, FALSE);
+                return 0;
+            case IdParallelPlus:
+                state->workingConfig.maxParallelDownloads = std::clamp(state->workingConfig.maxParallelDownloads + 1, 3, 10);
+                RefreshSettingsButtons(state);
+                InvalidateRect(state->window, &kParallelValueRect, FALSE);
+                return 0;
             case IdCopy:
                 CopyToClipboard(window, state->message);
+                return 0;
+            case IdCheckUpdates:
+                try {
+                    const ReleaseAssetInfo release = AppUpdateService::CheckLatestRelease();
+                    if (release.found) {
+                        ShowInfoDialog(
+                            window,
+                            state->instance,
+                            L"Обновление найдено",
+                            L"Последняя версия: " + release.version + L"\n\n" + release.pageUrl
+                        );
+                    } else {
+                        ShowInfoDialog(window, state->instance, L"Обновления", L"Не удалось найти установочный архив в последнем релизе.");
+                    }
+                } catch (const std::exception& ex) {
+                    ShowErrorDialog(
+                        window,
+                        state->instance,
+                        L"Проверка обновлений не удалась",
+                        std::wstring(ex.what(), ex.what() + std::strlen(ex.what()))
+                    );
+                }
                 return 0;
             case IdAbout:
                 ShowAboutDialog(window, state->instance);
@@ -586,8 +767,16 @@ LRESULT CALLBACK DialogWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
             case IdInstall:
             case IdChoose:
             case IdSkip:
-            case IdOk:
             case IdCancel:
+                DestroyWindow(window);
+                return 0;
+            case IdOk:
+                if (state->type == DialogType::Settings && state->config) {
+                    *state->config = state->workingConfig;
+                    if (state->savedResult) {
+                        *state->savedResult = true;
+                    }
+                }
                 DestroyWindow(window);
                 return 0;
             default:
@@ -688,14 +877,11 @@ LRESULT CALLBACK DialogButtonProc(HWND window, UINT message, WPARAM wParam, LPAR
 
     case WM_PAINT:
         {
-            PAINTSTRUCT paint = {};
-            HDC dc = BeginPaint(window, &paint);
-            RECT client = {};
-            GetClientRect(window, &client);
-            if (state) {
-                UiRenderer::DrawButton(dc, client, state->text.c_str(), state->primary, state->pressed, state->hot, true);
-            }
-            EndPaint(window, &paint);
+            PaintBuffered(window, [state](HDC dc, const RECT& client) {
+                if (state) {
+                    UiRenderer::DrawButton(dc, client, state->text.c_str(), state->primary, state->pressed, state->hot, true);
+                }
+            });
         }
         return 0;
 
@@ -818,60 +1004,56 @@ LRESULT CALLBACK ScrollTextProc(HWND window, UINT message, WPARAM wParam, LPARAM
 
     case WM_PAINT:
         if (state) {
-            PAINTSTRUCT paint = {};
-            HDC dc = BeginPaint(window, &paint);
-            RECT client = {};
-            GetClientRect(window, &client);
+            PaintBuffered(window, [window, state](HDC dc, const RECT& client) {
+                UiRenderer::DrawInputFrame(dc, client);
 
-            UiRenderer::DrawInputFrame(dc, client);
+                HFONT font = CreateUiFont(-15, FW_NORMAL);
+                const int textWidth = std::max(40, static_cast<int>(client.right - client.left) - 38);
+                const int textHeight = MeasureTextHeight(dc, font, state->text, textWidth);
+                state->contentHeight = textHeight + kScrollTextTopPadding + kScrollTextBottomPadding;
+                ClampScroll(window, state, GetScrollVisibleEnd(client));
 
-            HFONT font = CreateUiFont(-15, FW_NORMAL);
-            const int textWidth = std::max(40, static_cast<int>(client.right - client.left) - 38);
-            const int textHeight = MeasureTextHeight(dc, font, state->text, textWidth);
-            state->contentHeight = textHeight + kScrollTextTopPadding + kScrollTextBottomPadding;
-            ClampScroll(window, state, GetScrollVisibleEnd(client));
-
-            RECT textRect = {
-                client.left + 14,
-                client.top + kScrollTextTopPadding - state->scrollY,
-                client.right - 24,
-                client.top + kScrollTextTopPadding - state->scrollY + textHeight
-            };
-            HRGN clip = CreateRectRgn(
-                client.left + 10,
-                client.top + kScrollTextClipTopPadding,
-                client.right - 16,
-                client.bottom - kScrollTextClipBottomPadding
-            );
-            SelectClipRgn(dc, clip);
-            DrawTextBlock(dc, state->text, textRect, kTextColor, font, DT_LEFT | DT_WORDBREAK);
-            SelectClipRgn(dc, nullptr);
-            DeleteObject(clip);
-
-            if (state->contentHeight > GetScrollVisibleEnd(client)) {
-                Gdiplus::Graphics graphics(dc);
-                graphics.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
-                RECT thumb = GetScrollbarThumb(client, state->contentHeight, state->scrollY);
-                Gdiplus::SolidBrush trackBrush(Gdiplus::Color(255, 39, 39, 43));
-                Gdiplus::SolidBrush thumbBrush(Gdiplus::Color(255, 86, 86, 92));
-                graphics.FillRectangle(
-                    &trackBrush,
-                    static_cast<INT>(client.right - 14),
-                    static_cast<INT>(client.top + 8),
-                    6,
-                    static_cast<INT>(client.bottom - client.top - 16)
+                RECT textRect = {
+                    client.left + 14,
+                    client.top + kScrollTextTopPadding - state->scrollY,
+                    client.right - 24,
+                    client.top + kScrollTextTopPadding - state->scrollY + textHeight
+                };
+                HRGN clip = CreateRectRgn(
+                    client.left + 10,
+                    client.top + kScrollTextClipTopPadding,
+                    client.right - 16,
+                    client.bottom - kScrollTextClipBottomPadding
                 );
-                graphics.FillRectangle(
-                    &thumbBrush,
-                    static_cast<INT>(thumb.left),
-                    static_cast<INT>(thumb.top),
-                    static_cast<INT>(thumb.right - thumb.left),
-                    static_cast<INT>(thumb.bottom - thumb.top)
-                );
-            }
+                SelectClipRgn(dc, clip);
+                DrawTextBlock(dc, state->text, textRect, kTextColor, font, DT_LEFT | DT_WORDBREAK);
+                SelectClipRgn(dc, nullptr);
+                DeleteObject(clip);
 
-            DeleteObject(font);
-            EndPaint(window, &paint);
+                if (state->contentHeight > GetScrollVisibleEnd(client)) {
+                    Gdiplus::Graphics graphics(dc);
+                    graphics.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+                    RECT thumb = GetScrollbarThumb(client, state->contentHeight, state->scrollY);
+                    Gdiplus::SolidBrush trackBrush(Gdiplus::Color(255, 39, 39, 43));
+                    Gdiplus::SolidBrush thumbBrush(Gdiplus::Color(255, 86, 86, 92));
+                    graphics.FillRectangle(
+                        &trackBrush,
+                        static_cast<INT>(client.right - 14),
+                        static_cast<INT>(client.top + 8),
+                        6,
+                        static_cast<INT>(client.bottom - client.top - 16)
+                    );
+                    graphics.FillRectangle(
+                        &thumbBrush,
+                        static_cast<INT>(thumb.left),
+                        static_cast<INT>(thumb.top),
+                        static_cast<INT>(thumb.right - thumb.left),
+                        static_cast<INT>(thumb.bottom - thumb.top)
+                    );
+                }
+
+                DeleteObject(font);
+            });
         }
         return 0;
 
@@ -907,12 +1089,22 @@ void ShowErrorDialog(HWND owner, HINSTANCE instance, const std::wstring& title, 
 }
 
 void ShowSettingsDialog(HWND owner, HINSTANCE instance) {
+    AppConfig ignored;
+    ShowSettingsDialog(owner, instance, ignored);
+}
+
+bool ShowSettingsDialog(HWND owner, HINSTANCE instance, AppConfig& config) {
     auto* state = new DialogState{};
     state->type = DialogType::Settings;
     state->instance = instance;
     state->owner = owner;
     state->title = L"Настройки";
+    state->config = &config;
+    state->workingConfig = config;
+    bool saved = false;
+    state->savedResult = &saved;
     ShowModal(state, 620, 560);
+    return saved;
 }
 
 void ShowAboutDialog(HWND owner, HINSTANCE instance) {
@@ -924,7 +1116,7 @@ void ShowAboutDialog(HWND owner, HINSTANCE instance) {
     state->message =
         L"YouTube Downloader\n\n"
         L"Портативный Win32 загрузчик видео с YouTube.\n\n"
-        L"Версия UI-прототипа: 0.1.0";
+        L"Версия: 0.1.0";
     ShowModal(state, 560, 360);
 }
 

@@ -1,10 +1,17 @@
 #include "YtDlpClient.h"
 
+#include "BackendText.h"
+#include "ProcessRunner.h"
+#include "WinHttpClient.h"
+
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <cwchar>
 #include <map>
 #include <optional>
 #include <sstream>
+#include <system_error>
 
 namespace {
 
@@ -91,6 +98,100 @@ std::wstring StageFor(const std::wstring& status, const std::wstring& part) {
     return L"Скачивание:";
 }
 
+std::wstring JsonWide(const nlohmann::json& json, const char* key) {
+    const auto it = json.find(key);
+    if (it == json.end() || !it->is_string()) {
+        return {};
+    }
+    try {
+        return Utf8ToWide(it->get<std::string>());
+    } catch (...) {
+        return {};
+    }
+}
+
+std::uint64_t JsonUInt64(const nlohmann::json& json, const char* key) {
+    const auto it = json.find(key);
+    if (it == json.end()) {
+        return 0;
+    }
+    if (it->is_number_unsigned()) {
+        return it->get<std::uint64_t>();
+    }
+    if (it->is_number_integer()) {
+        const auto value = it->get<std::int64_t>();
+        return value < 0 ? 0 : static_cast<std::uint64_t>(value);
+    }
+    return 0;
+}
+
+VideoPreview ParsePreviewObject(const nlohmann::json& object) {
+    VideoPreview preview;
+    if (!object.is_object()) {
+        return preview;
+    }
+
+    preview.id = JsonWide(object, "id");
+    preview.title = JsonWide(object, "title");
+    preview.uploader = JsonWide(object, "uploader");
+    preview.durationSeconds = JsonUInt64(object, "duration");
+    preview.thumbnailUrl = JsonWide(object, "thumbnail");
+    preview.webpageUrl = JsonWide(object, "webpage_url");
+    if (preview.webpageUrl.empty()) {
+        preview.webpageUrl = JsonWide(object, "url");
+    }
+    preview.isPlaylist = JsonWide(object, "_type") == L"playlist";
+
+    const auto entries = object.find("entries");
+    if (entries != object.end() && entries->is_array()) {
+        preview.isPlaylist = true;
+        for (const nlohmann::json& entry : *entries) {
+            VideoPreview item = ParsePreviewObject(entry);
+            if (item.webpageUrl.empty() && !item.id.empty()) {
+                item.webpageUrl = L"https://www.youtube.com/watch?v=" + item.id;
+            }
+            preview.entries.push_back(std::move(item));
+        }
+    }
+
+    return preview;
+}
+
+std::vector<std::wstring> BuildMetadataArguments(const std::wstring& url, const std::filesystem::path& cookiesPath, bool playlist) {
+    std::vector<std::wstring> args;
+    args.push_back(L"--dump-single-json");
+    if (playlist) {
+        args.push_back(L"--flat-playlist");
+    } else {
+        args.push_back(L"--no-playlist");
+    }
+    args.push_back(L"--no-warnings");
+    if (!cookiesPath.empty() && std::filesystem::is_regular_file(cookiesPath)) {
+        args.push_back(L"--cookies");
+        args.push_back(cookiesPath.wstring());
+    }
+    args.push_back(url);
+    return args;
+}
+
+std::filesystem::path ThumbnailPathFor(const std::filesystem::path& dir, const VideoPreview& preview) {
+    if (preview.id.empty() || preview.thumbnailUrl.empty()) {
+        return {};
+    }
+
+    std::wstring extension = L".jpg";
+    const size_t query = preview.thumbnailUrl.find(L'?');
+    const std::wstring cleanUrl = preview.thumbnailUrl.substr(0, query);
+    const size_t dot = cleanUrl.find_last_of(L'.');
+    if (dot != std::wstring::npos && dot + 1 < cleanUrl.size()) {
+        std::wstring candidate = cleanUrl.substr(dot);
+        if (candidate.size() <= 6) {
+            extension = candidate;
+        }
+    }
+    return dir / (preview.id + extension);
+}
+
 } // namespace
 
 std::vector<std::wstring> BuildDownloadArguments(const YtDlpDownloadRequest& request) {
@@ -163,4 +264,59 @@ YtDlpProgress ParseYtDlpProgressLine(const std::wstring& line) {
 
     progress.stage = StageFor(progress.rawStatus, get(L"part"));
     return progress;
+}
+
+VideoPreview ParseVideoPreviewJson(const std::string& jsonText) {
+    try {
+        const nlohmann::json json = nlohmann::json::parse(jsonText);
+        return ParsePreviewObject(json);
+    } catch (...) {
+        return {};
+    }
+}
+
+YtDlpClient::YtDlpClient(YtDlpClientOptions options)
+    : m_options(std::move(options)) {
+}
+
+VideoPreview YtDlpClient::FetchPreview(const std::wstring& url, HANDLE cancelEvent) const {
+    ProcessRunOptions options;
+    options.executable = m_options.ytDlpExePath;
+    options.arguments = BuildMetadataArguments(url, m_options.cookiesPath, false);
+    options.timeoutMs = 30000;
+    options.cancelEvent = cancelEvent;
+
+    const ProcessRunResult result = ProcessRunner::Run(options);
+    if (result.exitCode != 0) {
+        throw std::runtime_error("yt-dlp preview failed");
+    }
+    return ParseVideoPreviewJson(WideToUtf8(result.stdoutText));
+}
+
+VideoPreview YtDlpClient::ExpandPlaylist(const std::wstring& url, HANDLE cancelEvent) const {
+    ProcessRunOptions options;
+    options.executable = m_options.ytDlpExePath;
+    options.arguments = BuildMetadataArguments(url, m_options.cookiesPath, true);
+    options.timeoutMs = 60000;
+    options.cancelEvent = cancelEvent;
+
+    const ProcessRunResult result = ProcessRunner::Run(options);
+    if (result.exitCode != 0) {
+        throw std::runtime_error("yt-dlp playlist expansion failed");
+    }
+    return ParseVideoPreviewJson(WideToUtf8(result.stdoutText));
+}
+
+std::filesystem::path YtDlpClient::CacheThumbnail(const VideoPreview& preview, HANDLE cancelEvent) const {
+    const std::filesystem::path target = ThumbnailPathFor(m_options.thumbCacheDir, preview);
+    if (target.empty()) {
+        return {};
+    }
+
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(target, ec)) {
+        return target;
+    }
+    WinHttpClient::DownloadFile(preview.thumbnailUrl, target, {}, cancelEvent);
+    return target;
 }

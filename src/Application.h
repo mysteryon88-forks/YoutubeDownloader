@@ -6,6 +6,16 @@
 
 #include <windows.h>
 
+#include "AppPaths.h"
+#include "Config.h"
+#include "DownloadQueue.h"
+#include "Logger.h"
+#include "ToolManagers.h"
+#include "YtDlpClient.h"
+
+#include <atomic>
+#include <memory>
+#include <mutex>
 #include <string>
 
 class Application {
@@ -29,6 +39,12 @@ private:
     void DrawControlFrames(HDC dc);
     void SetControlFonts();
     void SetStatus(const std::wstring& text);
+    void InitializeBackend();
+    void StartToolCheck();
+    void StartPreviewFetch();
+    void EnqueueCurrentUrl();
+    void RefreshQueueText();
+    std::wstring GetWindowTextString(HWND control) const;
 
     HINSTANCE m_instance = nullptr;
     HWND m_window = nullptr;
@@ -52,4 +68,16 @@ private:
     HBRUSH m_backgroundBrush = nullptr;
     HBRUSH m_panelBrush = nullptr;
     ULONG_PTR m_gdiplusToken = 0;
+
+    std::unique_ptr<AppPaths> m_paths;
+    AppConfig m_config;
+    std::unique_ptr<Logger> m_logger;
+    FfmpegStatus m_ffmpeg;
+    ToolInstallStatus m_ytDlpStatus;
+    std::unique_ptr<YtDlpClient> m_ytDlpClient;
+    std::unique_ptr<DownloadQueue> m_downloadQueue;
+    std::mutex m_previewMutex;
+    VideoPreview m_preview;
+    std::atomic<unsigned long> m_previewRequestId = 0;
+    bool m_ytDlpReady = false;
 };

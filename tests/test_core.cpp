@@ -492,7 +492,7 @@ void TestYtDlpUpdateDecision() {
 void TestAppUpdateDecision() {
     ReleaseAssetInfo latest;
     latest.found = true;
-    latest.version = L"1.0.2";
+    latest.version = L"1.0.3";
     Require(ShouldInstallAppUpdate(latest), "newer app version should be offered");
 
     latest.version = YTD_APP_VERSION_WIDE;

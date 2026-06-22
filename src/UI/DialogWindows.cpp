@@ -3,6 +3,7 @@
 #include "AppVersion.h"
 #include "BackendText.h"
 #include "ToolManagers.h"
+#include "UiActions.h"
 #include "UiRenderer.h"
 
 #include <commctrl.h>
@@ -472,7 +473,8 @@ void CenterWindow(HWND window, HWND owner, int width, int height) {
 }
 
 void RunModal(HWND owner, HWND window) {
-    if (owner) {
+    const bool ownerWasEnabled = owner && IsWindow(owner) && IsWindowEnabled(owner);
+    if (ownerWasEnabled) {
         EnableWindow(owner, FALSE);
     }
 
@@ -489,13 +491,7 @@ void RunModal(HWND owner, HWND window) {
         }
     }
 
-    if (owner && IsWindow(owner)) {
-        EnableWindow(owner, TRUE);
-        if (IsIconic(owner)) {
-            ShowWindow(owner, SW_RESTORE);
-        }
-        BringWindowToTop(owner);
-    }
+    RestoreModalOwner(owner, ownerWasEnabled);
 }
 
 void ShowModal(DialogState* state, int width, int height) {

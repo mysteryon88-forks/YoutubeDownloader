@@ -4,6 +4,7 @@
 #include "DialogWindows.h"
 #include "KeyboardShortcuts.h"
 #include "resource.h"
+#include "UiActions.h"
 #include "UiRenderer.h"
 
 #include <commctrl.h>
@@ -562,12 +563,8 @@ bool Application::HandleMainWindowShortcut(const MSG& message) {
     const MainWindowShortcutAction action = ResolveMainWindowShortcut(controlDown, static_cast<unsigned int>(message.wParam));
     switch (action) {
     case MainWindowShortcutAction::PasteUrl:
-        if (m_urlEdit) {
-            SetFocus(m_urlEdit);
-            SendMessageW(m_urlEdit, WM_PASTE, 0, 0);
-            return true;
-        }
-        return false;
+        PasteReplacingEditText(m_urlEdit);
+        return true;
     case MainWindowShortcutAction::Download:
         if (m_downloadButton && IsWindowEnabled(m_downloadButton)) {
             EnqueueCurrentUrl();
@@ -816,8 +813,7 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         if (LOWORD(wParam) == IdPasteButton) {
-            SendMessageW(m_urlEdit, WM_PASTE, 0, 0);
-            StartPreviewFetch();
+            PasteReplacingEditText(m_urlEdit);
             return 0;
         }
         if (LOWORD(wParam) == IdChooseFolderButton) {
@@ -913,9 +909,6 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                 options.thumbCacheDir = m_paths->thumbCacheDir();
                 options.cookiesPath = m_config.cookiesPath;
                 m_ytDlpClient = std::make_unique<YtDlpClient>(std::move(options));
-                EnableWindow(m_downloadButton, TRUE);
-            } else {
-                EnableWindow(m_downloadButton, FALSE);
             }
             SetStatus(result->ready ? BuildToolReadyStatus(result->status, m_ffmpeg) : result->message);
         }
@@ -1065,7 +1058,6 @@ void Application::CreateControls() {
     m_statusLabel = CreateChild(m_window, L"STATIC", L"Подготовка интерфейса", SS_LEFT, 0, 0);
     m_queueLabel = CreateChild(m_window, L"STATIC", L"Очередь загрузок", SS_LEFT, 0, 0);
     m_queuePlaceholder = CreateChild(m_window, L"STATIC", L"Задач пока нет", SS_CENTER, 0, 0);
-    EnableWindow(m_downloadButton, FALSE);
 
     SetControlFonts();
     m_tooltip = CreateTooltipWindow(m_window);
@@ -1789,8 +1781,14 @@ void Application::StartPreviewFetch() {
 }
 
 void Application::EnqueueCurrentUrl() {
-    if (!m_ytDlpReady || !m_downloadQueue) {
-        ShowErrorDialog(m_window, m_instance, L"yt-dlp ещё не готов", L"Дождитесь завершения проверки или установки yt-dlp.");
+    const DownloadAttemptAction action = ResolveDownloadAttempt(m_ytDlpReady);
+    if (action == DownloadAttemptAction::ShowYtDlpNotReady || !m_downloadQueue) {
+        ShowErrorDialog(
+            m_window,
+            m_instance,
+            L"yt-dlp ещё не готов",
+            L"Дождитесь завершения проверки, установки или обновления yt-dlp."
+        );
         return;
     }
 

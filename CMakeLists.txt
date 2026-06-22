@@ -79,6 +79,8 @@ add_executable(YoutubeDownloader WIN32
     src/UI/DialogWindows.h
     src/UI/resource.h
     src/UI/resource.rc
+    src/UI/UiActions.cpp
+    src/UI/UiActions.h
     src/UI/UiRenderer.cpp
     src/UI/UiRenderer.h
 )
@@ -107,10 +109,19 @@ set_target_properties(YoutubeDownloader PROPERTIES
 )
 
 add_executable(YoutubeDownloaderTests
+    src/UI/UiActions.cpp
+    src/UI/UiActions.h
     tests/test_core.cpp
 )
 
-target_link_libraries(YoutubeDownloaderTests PRIVATE YoutubeDownloaderCore)
+target_include_directories(YoutubeDownloaderTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/UI
+)
+
+target_link_libraries(YoutubeDownloaderTests PRIVATE
+    YoutubeDownloaderCore
+    user32
+)
 
 if(MSVC)
     target_compile_options(YoutubeDownloaderTests PRIVATE /W4 /permissive- /utf-8)

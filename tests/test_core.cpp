@@ -6,18 +6,22 @@
 #include "KeyboardShortcuts.h"
 #include "ProcessRunner.h"
 #include "ToolManagers.h"
+#include "UiActions.h"
 #include "Version.h"
 #include "YtDlpClient.h"
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <ranges>
 #include <string>
-#include <thread>
 #include <system_error>
+#include <thread>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -138,6 +142,140 @@ void TestMainWindowShortcutResolution() {
         ResolveMainWindowShortcut(false, 'V') == MainWindowShortcutAction::None,
         "V without Ctrl should not trigger paste"
     );
+}
+
+void TestDownloadAttemptResolution() {
+    Require(
+        ResolveDownloadAttempt(false) == DownloadAttemptAction::ShowYtDlpNotReady,
+        "download should show a readiness message when yt-dlp is unavailable"
+    );
+    Require(
+        ResolveDownloadAttempt(true) == DownloadAttemptAction::Enqueue,
+        "download should enqueue when yt-dlp is ready"
+    );
+}
+
+struct PasteEditSubclassState {
+    WNDPROC originalWindowProc = nullptr;
+    const wchar_t* replacementText = nullptr;
+    bool pasteReceived = false;
+};
+
+LRESULT CALLBACK PasteEditSubclassProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    auto* state = reinterpret_cast<PasteEditSubclassState*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (state != nullptr && message == WM_PASTE) {
+        state->pasteReceived = true;
+        SendMessageW(
+            window,
+            EM_REPLACESEL,
+            TRUE,
+            reinterpret_cast<LPARAM>(state->replacementText)
+        );
+        return 0;
+    }
+
+    if (state != nullptr && state->originalWindowProc != nullptr) {
+        return CallWindowProcW(state->originalWindowProc, window, message, wParam, lParam);
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+void TestPasteReplacesExistingEditText() {
+    const std::wstring existingUrl = L"https://example.invalid/old";
+    const std::wstring replacementUrl = L"https://www.youtube.com/watch?v=unicode_тест";
+
+    HWND edit = CreateWindowExW(
+        0,
+        L"EDIT",
+        existingUrl.c_str(),
+        WS_POPUP | ES_AUTOHSCROLL,
+        0,
+        0,
+        320,
+        24,
+        nullptr,
+        nullptr,
+        GetModuleHandleW(nullptr),
+        nullptr
+    );
+    Require(edit != nullptr, "failed to create hidden edit control");
+
+    PasteEditSubclassState state;
+    state.replacementText = replacementUrl.c_str();
+    SetWindowLongPtrW(edit, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&state));
+    state.originalWindowProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
+        edit,
+        GWLP_WNDPROC,
+        reinterpret_cast<LONG_PTR>(PasteEditSubclassProc)
+    ));
+    const bool subclassInstalled = state.originalWindowProc != nullptr;
+    std::wstring pastedText;
+    bool editFocused = false;
+    if (subclassInstalled) {
+        PasteReplacingEditText(edit);
+
+        const int textLength = GetWindowTextLengthW(edit);
+        std::vector<wchar_t> textBuffer(static_cast<std::size_t>(textLength) + 1);
+        GetWindowTextW(edit, textBuffer.data(), static_cast<int>(textBuffer.size()));
+        pastedText = textBuffer.data();
+        editFocused = GetFocus() == edit;
+
+        SetWindowLongPtrW(edit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(state.originalWindowProc));
+    }
+    SetWindowLongPtrW(edit, GWLP_USERDATA, 0);
+    DestroyWindow(edit);
+
+    Require(subclassInstalled, "failed to subclass hidden edit control");
+    Require(state.pasteReceived, "paste action should send WM_PASTE to the edit control");
+    Require(editFocused, "paste should focus the edit control");
+    Require(pastedText == replacementUrl, "paste should replace the complete edit text");
+}
+
+void TestPasteReplacingEditTextIgnoresInvalidHandles() {
+    PasteReplacingEditText(nullptr);
+    PasteReplacingEditText(reinterpret_cast<HWND>(static_cast<std::uintptr_t>(1)));
+}
+
+void TestModalOwnerRestorationPreservesEnabledState() {
+    HWND owner = CreateWindowExW(
+        0,
+        L"STATIC",
+        L"Hidden owner",
+        WS_OVERLAPPEDWINDOW,
+        -32000,
+        -32000,
+        320,
+        200,
+        nullptr,
+        nullptr,
+        GetModuleHandleW(nullptr),
+        nullptr
+    );
+    Require(owner != nullptr, "failed to create hidden owner window");
+
+    EnableWindow(owner, FALSE);
+    RestoreModalOwner(owner, false);
+    Require(IsWindowEnabled(owner) == FALSE, "owner should stay disabled when it was not previously enabled");
+
+    ShowWindow(owner, SW_SHOWMINNOACTIVE);
+    const bool wasIconic = IsIconic(owner) != FALSE;
+    RestoreModalOwner(owner, true);
+    const bool ownerEnabled = IsWindowEnabled(owner) != FALSE;
+    const bool ownerRestored = IsIconic(owner) == FALSE;
+    const bool ownerActivated = GetActiveWindow() == owner;
+
+    ShowWindow(owner, SW_HIDE);
+    DestroyWindow(owner);
+
+    Require(wasIconic, "owner fixture should start minimized");
+    Require(ownerEnabled, "owner should be re-enabled when it was previously enabled");
+    Require(ownerRestored, "iconic owner should be restored");
+    Require(ownerActivated, "restored owner should become the active window on its creating thread");
+}
+
+void TestRestoreModalOwnerIgnoresInvalidHandles() {
+    RestoreModalOwner(nullptr, true);
+    RestoreModalOwner(reinterpret_cast<HWND>(static_cast<std::uintptr_t>(1)), true);
 }
 
 void TestConfigParallelDownloadBounds() {
@@ -1091,6 +1229,11 @@ int main() {
     TestConfigDefaultsAndRoundTrip();
     TestConfigDropsLegacyFfmpegPromptFlag();
     TestMainWindowShortcutResolution();
+    TestDownloadAttemptResolution();
+    TestPasteReplacesExistingEditText();
+    TestPasteReplacingEditTextIgnoresInvalidHandles();
+    TestModalOwnerRestorationPreservesEnabledState();
+    TestRestoreModalOwnerIgnoresInvalidHandles();
     TestConfigParallelDownloadBounds();
     TestConfigUtf8RoundTrip();
     TestProgressPresentation();

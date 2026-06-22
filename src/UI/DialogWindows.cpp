@@ -631,12 +631,12 @@ void LayoutSettingsDialog(DialogState* state, int width, int height) {
     if (ffmpeg) {
         MoveWindow(ffmpeg, 24, 416, 178, 34, TRUE);
     }
-    if (about) {
-        MoveWindow(about, 214, 416, 150, 34, TRUE);
-    }
     const int panelRight = width - kDialogPanelInset;
     const int panelBottom = height - kDialogPanelInset;
     const int bottomButtonY = panelBottom - kDialogButtonInset - kDialogButtonHeight;
+    if (about) {
+        MoveWindow(about, 24, bottomButtonY, 178, kDialogButtonHeight, TRUE);
+    }
     if (cancel) {
         MoveWindow(
             cancel,

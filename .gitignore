@@ -1,6 +1,7 @@
 build/
 .vs/
 out/
+.worktrees/
 *.user
 *.suo
 *.VC.db

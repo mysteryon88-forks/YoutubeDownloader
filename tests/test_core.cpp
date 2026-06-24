@@ -4,6 +4,7 @@
 #include "Config.h"
 #include "DownloadQueue.h"
 #include "KeyboardShortcuts.h"
+#include "Logger.h"
 #include "ProcessRunner.h"
 #include "ToolManagers.h"
 #include "UiActions.h"
@@ -317,6 +318,38 @@ void TestConfigUtf8RoundTrip() {
     Require(loaded.quality == L"1080p", "utf8 quality round-trip mismatch");
     Require(loaded.container == L"mkv", "utf8 container round-trip mismatch");
     Require(loaded.lastYtDlpVersion == L"2026.06.17", "utf8 version round-trip mismatch");
+}
+
+void TestLoggerTruncatesAtStartupAndAppendsWithinRun() {
+    const fs::path root = MakeTempRoot(L"YoutubeDownloaderTests_Logger");
+    const AppPaths paths(root);
+    fs::create_directories(paths.stuffDir());
+    {
+        std::ofstream old(paths.logPath(), std::ios::binary | std::ios::trunc);
+        old << "old-run";
+    }
+
+    Logger logger(paths);
+    {
+        std::ifstream truncated(paths.logPath(), std::ios::binary);
+        const std::string text{
+            std::istreambuf_iterator<char>(truncated),
+            std::istreambuf_iterator<char>()
+        };
+        Require(text.empty(), "logger should truncate the previous run");
+    }
+
+    logger.Info(L"startup");
+    logger.Error(L"failure");
+
+    std::ifstream current(paths.logPath(), std::ios::binary);
+    const std::string text{
+        std::istreambuf_iterator<char>(current),
+        std::istreambuf_iterator<char>()
+    };
+    Require(text.find("old-run") == std::string::npos, "old log content should be removed");
+    Require(text.find("startup") != std::string::npos, "startup log entry missing");
+    Require(text.find("failure") != std::string::npos, "error log entry missing");
 }
 
 void TestProgressPresentation() {
@@ -1236,6 +1269,7 @@ int main() {
     TestRestoreModalOwnerIgnoresInvalidHandles();
     TestConfigParallelDownloadBounds();
     TestConfigUtf8RoundTrip();
+    TestLoggerTruncatesAtStartupAndAppendsWithinRun();
     TestProgressPresentation();
     TestVersionCompare();
     TestYtDlpDownloadArguments();

@@ -115,7 +115,6 @@ private:
     std::unique_ptr<Logger> m_logger;
     FfmpegStatus m_ffmpeg;
     ToolInstallStatus m_ytDlpStatus;
-    std::unique_ptr<YtDlpClient> m_ytDlpClient;
     std::unique_ptr<DownloadQueue> m_downloadQueue;
     std::jthread m_toolCheckWorker;
     std::jthread m_appUpdateWorker;

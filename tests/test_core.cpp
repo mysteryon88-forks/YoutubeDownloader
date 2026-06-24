@@ -51,7 +51,6 @@ void TestAppPaths() {
     const AppPaths paths(root);
 
     Require(paths.root() == root, "root path mismatch");
-    Require(paths.assetsDir() == root / L"assets", "assets path mismatch");
     Require(paths.stuffDir() == root / L"stuff", "stuff path mismatch");
     Require(paths.configPath() == root / L"stuff" / L"config.ini", "config path mismatch");
     Require(paths.logPath() == root / L"stuff" / L"ytdl.log", "log path mismatch");
@@ -548,7 +547,6 @@ void TestGitHubReleaseParsing() {
     const ReleaseAssetInfo ytDlp = ParseGitHubReleaseAsset(ytDlpRelease, "yt-dlp.exe");
     Require(ytDlp.found, "yt-dlp asset not found");
     Require(ytDlp.version == L"2026.06.09", "yt-dlp release version mismatch");
-    Require(ytDlp.pageUrl == L"https://github.com/yt-dlp/yt-dlp/releases/tag/2026.06.09", "yt-dlp page url mismatch");
     Require(ytDlp.downloadUrl == L"https://example.invalid/yt-dlp.exe", "yt-dlp asset url mismatch");
 
     const std::string appRelease = R"json(
@@ -783,13 +781,17 @@ void TestDownloadQueueSchedulingAndRetry() {
     std::atomic<int> attempts = 0;
 
     DownloadQueue queue(2);
-    queue.SetExecutor([&](const DownloadTaskSnapshot& task, const DownloadTaskCallbacks& callbacks) {
+    queue.SetExecutor([&](
+        const DownloadTaskSnapshot& task,
+        std::stop_token,
+        const DownloadTaskCallbacks& callbacks
+    ) {
         UNREFERENCED_PARAMETER(task);
         const int now = ++running;
         int observed = maxRunning.load();
         while (now > observed && !maxRunning.compare_exchange_weak(observed, now)) {
         }
-        callbacks.onProgress(25.0, L"running");
+        UNREFERENCED_PARAMETER(callbacks);
         std::this_thread::sleep_for(std::chrono::milliseconds(80));
         --running;
         ++attempts;
@@ -815,7 +817,11 @@ void TestDownloadQueueSchedulingAndRetry() {
     Require(queue.GetTask(third).state == DownloadTaskState::Completed, "third task should complete");
     Require(queue.ClearFinished() == 3, "clear finished should remove completed tasks");
 
-    queue.SetExecutor([&](const DownloadTaskSnapshot& task, const DownloadTaskCallbacks& callbacks) {
+    queue.SetExecutor([&](
+        const DownloadTaskSnapshot& task,
+        std::stop_token,
+        const DownloadTaskCallbacks& callbacks
+    ) {
         UNREFERENCED_PARAMETER(task);
         UNREFERENCED_PARAMETER(callbacks);
         ++attempts;
@@ -825,9 +831,13 @@ void TestDownloadQueueSchedulingAndRetry() {
     queue.WaitForIdle();
     Require(queue.GetTask(failing).state == DownloadTaskState::Failed, "failing task should fail");
 
-    queue.SetExecutor([&](const DownloadTaskSnapshot& task, const DownloadTaskCallbacks& callbacks) {
+    queue.SetExecutor([&](
+        const DownloadTaskSnapshot& task,
+        std::stop_token,
+        const DownloadTaskCallbacks& callbacks
+    ) {
         UNREFERENCED_PARAMETER(task);
-        callbacks.onProgress(100.0, L"retry complete");
+        UNREFERENCED_PARAMETER(callbacks);
         ++attempts;
         return DownloadTaskResult{true, L"", {}};
     });
@@ -835,6 +845,35 @@ void TestDownloadQueueSchedulingAndRetry() {
     queue.WaitForIdle();
     Require(queue.GetTask(failing).state == DownloadTaskState::Completed, "retried task should complete");
     Require(attempts.load() >= 5, "executor attempt count mismatch");
+}
+
+void TestDownloadQueueLogsTaskLifecycle() {
+    const fs::path root = MakeTempRoot(L"YoutubeDownloaderTests_QueueLogger");
+    const AppPaths paths(root);
+    Logger logger(paths);
+    DownloadQueue queue(1, &logger);
+    queue.SetExecutor([](
+        const DownloadTaskSnapshot& task,
+        std::stop_token,
+        const DownloadTaskCallbacks& callbacks
+    ) {
+        UNREFERENCED_PARAMETER(task);
+        UNREFERENCED_PARAMETER(callbacks);
+        return DownloadTaskResult{true, L"", {}};
+    });
+
+    YtDlpDownloadRequest request;
+    request.url = L"https://example.invalid/logged-task";
+    queue.Enqueue(request, L"Logged task");
+    queue.WaitForIdle();
+
+    std::ifstream log(paths.logPath(), std::ios::binary);
+    const std::string text{
+        std::istreambuf_iterator<char>(log),
+        std::istreambuf_iterator<char>()
+    };
+    Require(text.find("https://example.invalid/logged-task") != std::string::npos, "queue log should identify the task URL");
+    Require(text.find("completed") != std::string::npos, "queue log should record task completion");
 }
 
 void TestDownloadQueueShutdownWaitsForActiveWorker() {
@@ -912,7 +951,11 @@ void TestDownloadQueueUpdatesParallelismAtRuntime() {
 
 void TestDownloadQueueRejectsDuplicateVisibleUrl() {
     DownloadQueue queue(1);
-    queue.SetExecutor([](const DownloadTaskSnapshot& task, const DownloadTaskCallbacks& callbacks) {
+    queue.SetExecutor([](
+        const DownloadTaskSnapshot& task,
+        std::stop_token,
+        const DownloadTaskCallbacks& callbacks
+    ) {
         UNREFERENCED_PARAMETER(task);
         UNREFERENCED_PARAMETER(callbacks);
         std::this_thread::sleep_for(std::chrono::milliseconds(80));
@@ -933,7 +976,11 @@ void TestDownloadQueueRejectsDuplicateVisibleUrl() {
 
 void TestDownloadQueueEnrichesDuplicateVisibleUrl() {
     DownloadQueue queue(1);
-    queue.SetExecutor([](const DownloadTaskSnapshot& task, const DownloadTaskCallbacks& callbacks) {
+    queue.SetExecutor([](
+        const DownloadTaskSnapshot& task,
+        std::stop_token,
+        const DownloadTaskCallbacks& callbacks
+    ) {
         UNREFERENCED_PARAMETER(task);
         UNREFERENCED_PARAMETER(callbacks);
         std::this_thread::sleep_for(std::chrono::milliseconds(80));
@@ -957,7 +1004,11 @@ void TestDownloadQueueEnrichesDuplicateVisibleUrl() {
 
 void TestDownloadQueueEnrichesExistingTaskAfterPreviewCompletes() {
     DownloadQueue queue(1);
-    queue.SetExecutor([](const DownloadTaskSnapshot& task, const DownloadTaskCallbacks& callbacks) {
+    queue.SetExecutor([](
+        const DownloadTaskSnapshot& task,
+        std::stop_token,
+        const DownloadTaskCallbacks& callbacks
+    ) {
         UNREFERENCED_PARAMETER(task);
         UNREFERENCED_PARAMETER(callbacks);
         std::this_thread::sleep_for(std::chrono::milliseconds(80));
@@ -979,10 +1030,15 @@ void TestDownloadQueueEnrichesExistingTaskAfterPreviewCompletes() {
 
 void TestDownloadQueueCancelAndDeleteTask() {
     DownloadQueue queue(1);
-    queue.SetExecutor([](const DownloadTaskSnapshot& task, const DownloadTaskCallbacks& callbacks) {
+    queue.SetExecutor([](
+        const DownloadTaskSnapshot& task,
+        std::stop_token stopToken,
+        const DownloadTaskCallbacks& callbacks
+    ) {
         UNREFERENCED_PARAMETER(task);
+        UNREFERENCED_PARAMETER(callbacks);
         for (int i = 0; i < 20; ++i) {
-            if (callbacks.isCanceled && callbacks.isCanceled()) {
+            if (stopToken.stop_requested()) {
                 return DownloadTaskResult{false, L"canceled", {}};
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -1012,7 +1068,11 @@ void TestDownloadQueueCloseCompletedTaskKeepsOutputFile() {
     }
 
     DownloadQueue queue(1);
-    queue.SetExecutor([&](const DownloadTaskSnapshot& task, const DownloadTaskCallbacks& callbacks) {
+    queue.SetExecutor([&](
+        const DownloadTaskSnapshot& task,
+        std::stop_token,
+        const DownloadTaskCallbacks& callbacks
+    ) {
         UNREFERENCED_PARAMETER(task);
         callbacks.onOutputLine(L"[download] Destination: " + output.wstring());
         return DownloadTaskResult{true, L"", {}};
@@ -1036,7 +1096,11 @@ void TestDownloadQueueDeleteCanceledTaskRemovesPartialFile() {
     const fs::path partial = fs::path(output.wstring() + L".part");
 
     DownloadQueue queue(1);
-    queue.SetExecutor([&](const DownloadTaskSnapshot& task, const DownloadTaskCallbacks& callbacks) {
+    queue.SetExecutor([&](
+        const DownloadTaskSnapshot& task,
+        std::stop_token stopToken,
+        const DownloadTaskCallbacks& callbacks
+    ) {
         UNREFERENCED_PARAMETER(task);
         callbacks.onOutputLine(L"[download] Destination: " + output.wstring());
         {
@@ -1044,7 +1108,7 @@ void TestDownloadQueueDeleteCanceledTaskRemovesPartialFile() {
             out << "partial video";
         }
         for (int i = 0; i < 50; ++i) {
-            if (callbacks.isCanceled && callbacks.isCanceled()) {
+            if (stopToken.stop_requested()) {
                 return DownloadTaskResult{false, L"canceled", {}};
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -1073,7 +1137,11 @@ void TestDownloadQueueDeleteCanceledTaskHandlesIndentedDestinationAndFragments()
     const fs::path fragment = fs::path(output.wstring() + L".part-Frag42.part");
 
     DownloadQueue queue(1);
-    queue.SetExecutor([&](const DownloadTaskSnapshot& task, const DownloadTaskCallbacks& callbacks) {
+    queue.SetExecutor([&](
+        const DownloadTaskSnapshot& task,
+        std::stop_token stopToken,
+        const DownloadTaskCallbacks& callbacks
+    ) {
         UNREFERENCED_PARAMETER(task);
         callbacks.onOutputLine(L"\r  [download] Destination: " + output.wstring());
         {
@@ -1085,7 +1153,7 @@ void TestDownloadQueueDeleteCanceledTaskHandlesIndentedDestinationAndFragments()
             out << "partial fragment";
         }
         for (int i = 0; i < 50; ++i) {
-            if (callbacks.isCanceled && callbacks.isCanceled()) {
+            if (stopToken.stop_requested()) {
                 return DownloadTaskResult{false, L"canceled", {}};
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -1113,14 +1181,19 @@ void TestDownloadQueueDeleteCanceledTaskFindsPartFileByVideoIdWhenDestinationWas
     const fs::path orphanPart = root / L"Example Title [SegQA7FyGt0].f137.mp4.part";
 
     DownloadQueue queue(1);
-    queue.SetExecutor([&](const DownloadTaskSnapshot& task, const DownloadTaskCallbacks& callbacks) {
+    queue.SetExecutor([&](
+        const DownloadTaskSnapshot& task,
+        std::stop_token stopToken,
+        const DownloadTaskCallbacks& callbacks
+    ) {
         UNREFERENCED_PARAMETER(task);
+        UNREFERENCED_PARAMETER(callbacks);
         {
             std::ofstream out(orphanPart);
             out << "partial video";
         }
         for (int i = 0; i < 50; ++i) {
-            if (callbacks.isCanceled && callbacks.isCanceled()) {
+            if (stopToken.stop_requested()) {
                 return DownloadTaskResult{false, L"canceled", {}};
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -1144,10 +1217,15 @@ void TestDownloadQueueDeleteCanceledTaskFindsPartFileByVideoIdWhenDestinationWas
 void TestDownloadQueueClearQueuedOnlyRemovesWaitingTasks() {
     std::atomic<bool> release = false;
     DownloadQueue queue(1);
-    queue.SetExecutor([&](const DownloadTaskSnapshot& task, const DownloadTaskCallbacks& callbacks) {
+    queue.SetExecutor([&](
+        const DownloadTaskSnapshot& task,
+        std::stop_token stopToken,
+        const DownloadTaskCallbacks& callbacks
+    ) {
         UNREFERENCED_PARAMETER(task);
+        UNREFERENCED_PARAMETER(callbacks);
         while (!release.load()) {
-            if (callbacks.isCanceled && callbacks.isCanceled()) {
+            if (stopToken.stop_requested()) {
                 return DownloadTaskResult{false, L"canceled", {}};
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -1180,7 +1258,11 @@ void TestDownloadQueueClearQueuedOnlyRemovesWaitingTasks() {
 
 void TestDownloadQueueClearFinishedKeepsQueuedTasks() {
     DownloadQueue queue(1);
-    queue.SetExecutor([](const DownloadTaskSnapshot& task, const DownloadTaskCallbacks& callbacks) {
+    queue.SetExecutor([](
+        const DownloadTaskSnapshot& task,
+        std::stop_token,
+        const DownloadTaskCallbacks& callbacks
+    ) {
         UNREFERENCED_PARAMETER(task);
         UNREFERENCED_PARAMETER(callbacks);
         std::this_thread::sleep_for(std::chrono::milliseconds(80));
@@ -1209,7 +1291,11 @@ void TestDownloadQueueDownloadedBytesDoNotMoveBackward() {
     const fs::path output = root / L"video.mp4";
 
     DownloadQueue queue(1);
-    queue.SetExecutor([&](const DownloadTaskSnapshot& task, const DownloadTaskCallbacks& callbacks) {
+    queue.SetExecutor([&](
+        const DownloadTaskSnapshot& task,
+        std::stop_token,
+        const DownloadTaskCallbacks& callbacks
+    ) {
         UNREFERENCED_PARAMETER(task);
         callbacks.onOutputLine(L"[download] Destination: " + output.wstring());
 
@@ -1252,7 +1338,11 @@ void TestDownloadQueueDownloadedBytesDoNotMoveBackward() {
 
 void TestDownloadQueueProgressPercentDoesNotMoveBackwardWithinTrack() {
     DownloadQueue queue(1);
-    queue.SetExecutor([](const DownloadTaskSnapshot& task, const DownloadTaskCallbacks& callbacks) {
+    queue.SetExecutor([](
+        const DownloadTaskSnapshot& task,
+        std::stop_token,
+        const DownloadTaskCallbacks& callbacks
+    ) {
         UNREFERENCED_PARAMETER(task);
         YtDlpProgress first;
         first.recognized = true;
@@ -1283,7 +1373,11 @@ void TestDownloadQueueProgressPercentDoesNotMoveBackwardWithinTrack() {
 
 void TestDownloadQueueIgnoresStaleVideoProgressAfterAudioStarts() {
     DownloadQueue queue(1);
-    queue.SetExecutor([](const DownloadTaskSnapshot& task, const DownloadTaskCallbacks& callbacks) {
+    queue.SetExecutor([](
+        const DownloadTaskSnapshot& task,
+        std::stop_token,
+        const DownloadTaskCallbacks& callbacks
+    ) {
         UNREFERENCED_PARAMETER(task);
         YtDlpProgress video;
         video.recognized = true;
@@ -1324,7 +1418,11 @@ void TestDownloadQueueIgnoresStaleVideoProgressAfterAudioStarts() {
 
 void TestDownloadQueueIgnoresUnclassifiedFinishedProgressAfterAudioStarts() {
     DownloadQueue queue(1);
-    queue.SetExecutor([](const DownloadTaskSnapshot& task, const DownloadTaskCallbacks& callbacks) {
+    queue.SetExecutor([](
+        const DownloadTaskSnapshot& task,
+        std::stop_token,
+        const DownloadTaskCallbacks& callbacks
+    ) {
         UNREFERENCED_PARAMETER(task);
         YtDlpProgress video;
         video.recognized = true;
@@ -1377,14 +1475,18 @@ void TestDownloadQueueClearFinishedDeletesInvalidPartFilesOnly() {
     }
 
     DownloadQueue queue(1);
-    queue.SetExecutor([&](const DownloadTaskSnapshot& task, const DownloadTaskCallbacks& callbacks) {
+    queue.SetExecutor([&](
+        const DownloadTaskSnapshot& task,
+        std::stop_token stopToken,
+        const DownloadTaskCallbacks& callbacks
+    ) {
         if (task.request.url.find(L"clearInvalid1") != std::wstring::npos) {
             {
                 std::ofstream out(canceledPart);
                 out << "partial video";
             }
             for (int i = 0; i < 50; ++i) {
-                if (callbacks.isCanceled && callbacks.isCanceled()) {
+                if (stopToken.stop_requested()) {
                     return DownloadTaskResult{false, L"canceled", {}};
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -1448,6 +1550,7 @@ int main() {
     TestProcessRunnerEmitsEachOutputLineOnce();
     TestYtDlpMetadataParsing();
     TestDownloadQueueSchedulingAndRetry();
+    TestDownloadQueueLogsTaskLifecycle();
     TestDownloadQueueShutdownWaitsForActiveWorker();
     TestDownloadQueueUpdatesParallelismAtRuntime();
     TestDownloadQueueRejectsDuplicateVisibleUrl();

@@ -18,6 +18,7 @@
 #include <functional>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -95,6 +96,12 @@ struct ScrollTextState {
     int dragStartScrollY = 0;
 };
 
+struct ProgressUpdate {
+    std::uint64_t downloaded = 0;
+    std::uint64_t total = 0;
+    std::wstring status;
+};
+
 struct DialogState {
     DialogType type = DialogType::Info;
     HINSTANCE instance = nullptr;
@@ -116,12 +123,10 @@ struct DialogState {
     bool progressSuccess = false;
     ProgressMode progressMode = ProgressMode::FfmpegInstall;
     ReleaseAssetInfo release;
-};
-
-struct ProgressUpdate {
-    std::uint64_t downloaded = 0;
-    std::uint64_t total = 0;
-    std::wstring status;
+    std::jthread worker;
+    std::mutex progressMutex;
+    std::optional<ProgressUpdate> pendingProgress;
+    std::optional<std::wstring> progressError;
 };
 
 void EnableDarkTitleBar(HWND window) {
@@ -871,29 +876,35 @@ void StartFfmpegInstallWorker(DialogState* state) {
     AppConfig* config = state->config;
     HANDLE cancelEvent = state->cancelEvent;
 
-    std::thread([window, paths, config, cancelEvent]() {
+    state->worker = std::jthread([state, window, paths, config, cancelEvent](std::stop_token) {
         try {
             const FfmpegStatus status = FfmpegManager::InstallEssentials(
                 paths,
-                [window](std::uint64_t downloaded, std::uint64_t total, const std::wstring& statusText) {
-                    auto* update = new ProgressUpdate{};
-                    update->downloaded = downloaded;
-                    update->total = total;
-                    update->status = statusText;
-                    PostMessageW(window, kProgressUpdateMessage, 0, reinterpret_cast<LPARAM>(update));
+                [state, window](std::uint64_t downloaded, std::uint64_t total, const std::wstring& statusText) {
+                    {
+                        std::lock_guard lock(state->progressMutex);
+                        state->pendingProgress = ProgressUpdate{downloaded, total, statusText};
+                    }
+                    PostMessageW(window, kProgressUpdateMessage, 0, 0);
                 },
                 cancelEvent
             );
             config->ffmpegPath = status.ffmpegExe;
             PostMessageW(window, kProgressDoneMessage, TRUE, 0);
         } catch (const std::exception& ex) {
-            auto* error = new std::wstring(ex.what(), ex.what() + std::strlen(ex.what()));
-            PostMessageW(window, kProgressDoneMessage, FALSE, reinterpret_cast<LPARAM>(error));
+            {
+                std::lock_guard lock(state->progressMutex);
+                state->progressError = std::wstring(ex.what(), ex.what() + std::strlen(ex.what()));
+            }
+            PostMessageW(window, kProgressDoneMessage, FALSE, 0);
         } catch (...) {
-            auto* error = new std::wstring(L"Неизвестная ошибка установки FFmpeg");
-            PostMessageW(window, kProgressDoneMessage, FALSE, reinterpret_cast<LPARAM>(error));
+            {
+                std::lock_guard lock(state->progressMutex);
+                state->progressError = L"Неизвестная ошибка установки FFmpeg";
+            }
+            PostMessageW(window, kProgressDoneMessage, FALSE, 0);
         }
-    }).detach();
+    });
 }
 
 void StartAppUpdateWorker(DialogState* state) {
@@ -906,17 +917,17 @@ void StartAppUpdateWorker(DialogState* state) {
     const ReleaseAssetInfo release = state->release;
     HANDLE cancelEvent = state->cancelEvent;
 
-    std::thread([window, paths, release, cancelEvent]() {
+    state->worker = std::jthread([state, window, paths, release, cancelEvent](std::stop_token) {
         try {
             const std::filesystem::path downloadedExe = AppUpdateService::DownloadUpdateExe(
                 paths,
                 release,
-                [window](std::uint64_t downloaded, std::uint64_t total) {
-                    auto* update = new ProgressUpdate{};
-                    update->downloaded = downloaded;
-                    update->total = total;
-                    update->status = L"Скачивание обновления...";
-                    PostMessageW(window, kProgressUpdateMessage, 0, reinterpret_cast<LPARAM>(update));
+                [state, window](std::uint64_t downloaded, std::uint64_t total) {
+                    {
+                        std::lock_guard lock(state->progressMutex);
+                        state->pendingProgress = ProgressUpdate{downloaded, total, L"Скачивание обновления..."};
+                    }
+                    PostMessageW(window, kProgressUpdateMessage, 0, 0);
                 },
                 cancelEvent
             );
@@ -926,13 +937,19 @@ void StartAppUpdateWorker(DialogState* state) {
             AppUpdateService::StartDownloadedUpdate(paths, downloadedExe);
             PostMessageW(window, kProgressDoneMessage, TRUE, 0);
         } catch (const std::exception& ex) {
-            auto* error = new std::wstring(ex.what(), ex.what() + std::strlen(ex.what()));
-            PostMessageW(window, kProgressDoneMessage, FALSE, reinterpret_cast<LPARAM>(error));
+            {
+                std::lock_guard lock(state->progressMutex);
+                state->progressError = std::wstring(ex.what(), ex.what() + std::strlen(ex.what()));
+            }
+            PostMessageW(window, kProgressDoneMessage, FALSE, 0);
         } catch (...) {
-            auto* error = new std::wstring(L"Неизвестная ошибка обновления приложения");
-            PostMessageW(window, kProgressDoneMessage, FALSE, reinterpret_cast<LPARAM>(error));
+            {
+                std::lock_guard lock(state->progressMutex);
+                state->progressError = L"Неизвестная ошибка обновления приложения";
+            }
+            PostMessageW(window, kProgressDoneMessage, FALSE, 0);
         }
-    }).detach();
+    });
 }
 
 void CreateProgressControls(DialogState* state) {
@@ -1163,8 +1180,6 @@ LRESULT CALLBACK DialogWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
             case IdAbout:
                 if (state->paths) {
                     ShowAboutDialog(window, state->instance, *state->paths);
-                } else {
-                    ShowAboutDialog(window, state->instance);
                 }
                 return 0;
             case IdFfmpeg:
@@ -1177,8 +1192,6 @@ LRESULT CALLBACK DialogWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
                             *state->savedResult = true;
                         }
                     }
-                } else {
-                    ShowFfmpegDialog(window, state->instance);
                 }
                 return 0;
             case IdInstall:
@@ -1239,7 +1252,15 @@ LRESULT CALLBACK DialogWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
 
     case kProgressUpdateMessage:
         if (state && state->type == DialogType::Progress) {
-            std::unique_ptr<ProgressUpdate> update(reinterpret_cast<ProgressUpdate*>(lParam));
+            std::optional<ProgressUpdate> update;
+            {
+                std::lock_guard lock(state->progressMutex);
+                update = std::move(state->pendingProgress);
+                state->pendingProgress.reset();
+            }
+            if (!update) {
+                return 0;
+            }
             state->message = update->status;
             state->progressDownloaded = update->downloaded;
             state->progressTotal = update->total;
@@ -1263,7 +1284,12 @@ LRESULT CALLBACK DialogWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
                     return 0;
                 }
             } else {
-                std::unique_ptr<std::wstring> error(reinterpret_cast<std::wstring*>(lParam));
+                std::optional<std::wstring> error;
+                {
+                    std::lock_guard lock(state->progressMutex);
+                    error = std::move(state->progressError);
+                    state->progressError.reset();
+                }
                 state->message = error
                     ? *error
                     : (state->progressMode == ProgressMode::AppUpdate
@@ -1299,6 +1325,13 @@ LRESULT CALLBACK DialogWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
                 }
             }
             state->tooltips.clear();
+        }
+        if (state && state->worker.joinable()) {
+            if (state->cancelEvent) {
+                SetEvent(state->cancelEvent);
+            }
+            state->worker.request_stop();
+            state->worker.join();
         }
         if (state && state->cancelEvent) {
             CloseHandle(state->cancelEvent);
@@ -1620,16 +1653,6 @@ void ShowErrorDialog(HWND owner, HINSTANCE instance, const std::wstring& title, 
     ShowModal(state, 620, 420);
 }
 
-void ShowSettingsDialog(HWND owner, HINSTANCE instance) {
-    AppConfig ignored;
-    ShowSettingsDialog(owner, instance, ignored);
-}
-
-bool ShowSettingsDialog(HWND owner, HINSTANCE instance, AppConfig& config) {
-    AppPaths emptyPaths(std::filesystem::path{});
-    return ShowSettingsDialog(owner, instance, emptyPaths, config);
-}
-
 bool ShowSettingsDialog(HWND owner, HINSTANCE instance, const AppPaths& paths, AppConfig& config) {
     auto* state = new DialogState{};
     state->type = DialogType::Settings;
@@ -1645,11 +1668,6 @@ bool ShowSettingsDialog(HWND owner, HINSTANCE instance, const AppPaths& paths, A
     return saved;
 }
 
-void ShowAboutDialog(HWND owner, HINSTANCE instance) {
-    AppPaths emptyPaths(std::filesystem::path{});
-    ShowAboutDialog(owner, instance, emptyPaths);
-}
-
 void ShowAboutDialog(HWND owner, HINSTANCE instance, const AppPaths& paths) {
     auto* state = new DialogState{};
     state->type = DialogType::About;
@@ -1662,12 +1680,6 @@ void ShowAboutDialog(HWND owner, HINSTANCE instance, const AppPaths& paths) {
         L"Портативный Win32 загрузчик видео с YouTube.\n\n"
         L"Версия: " YTD_APP_VERSION_WIDE;
     ShowModal(state, 560, 360);
-}
-
-void ShowFfmpegDialog(HWND owner, HINSTANCE instance) {
-    AppConfig ignored;
-    AppPaths emptyPaths(std::filesystem::path{});
-    ShowFfmpegDialog(owner, instance, emptyPaths, ignored);
 }
 
 bool ShowFfmpegDialog(HWND owner, HINSTANCE instance, const AppPaths& paths, AppConfig& config) {

@@ -7,7 +7,6 @@ public:
     explicit AppPaths(std::filesystem::path root);
 
     const std::filesystem::path& root() const;
-    std::filesystem::path assetsDir() const;
     std::filesystem::path stuffDir() const;
     std::filesystem::path configPath() const;
     std::filesystem::path logPath() const;

@@ -14,11 +14,12 @@
 #include <thread>
 #include <vector>
 
+class Logger;
+
 enum class DownloadTaskState {
     Queued,
     Preparing,
     Downloading,
-    PostProcessing,
     Completed,
     Failed,
     Canceled
@@ -32,7 +33,6 @@ struct DownloadTaskSnapshot {
     DownloadTaskState state = DownloadTaskState::Queued;
     double percent = 0.0;
     std::wstring statusText;
-    std::wstring lastOutputLine;
     std::wstring errorText;
     std::uint64_t downloadedBytes = 0;
     std::uint64_t totalBytes = 0;
@@ -46,10 +46,8 @@ struct DownloadTaskSnapshot {
 };
 
 struct DownloadTaskCallbacks {
-    std::function<void(double percent, const std::wstring& status)> onProgress;
     std::function<void(const YtDlpProgress& progress)> onProgressDetails;
     std::function<void(const std::wstring& line)> onOutputLine;
-    std::function<bool()> isCanceled;
 };
 
 struct DownloadTaskResult {
@@ -64,21 +62,15 @@ using DownloadTaskExecutor = std::function<DownloadTaskResult(
     const DownloadTaskCallbacks& callbacks
 )>;
 
-using LegacyDownloadTaskExecutor = std::function<DownloadTaskResult(
-    const DownloadTaskSnapshot& task,
-    const DownloadTaskCallbacks& callbacks
-)>;
-
 class DownloadQueue {
 public:
-    explicit DownloadQueue(int maxParallelDownloads);
+    explicit DownloadQueue(int maxParallelDownloads, Logger* logger = nullptr);
     ~DownloadQueue();
 
     DownloadQueue(const DownloadQueue&) = delete;
     DownloadQueue& operator=(const DownloadQueue&) = delete;
 
     void SetExecutor(DownloadTaskExecutor executor);
-    void SetExecutor(LegacyDownloadTaskExecutor executor);
     void SetMaxParallelDownloads(int maxParallelDownloads);
     int Enqueue(const YtDlpDownloadRequest& request, std::wstring title, std::filesystem::path thumbnailPath = {});
     bool EnrichMetadata(const std::wstring& url, std::wstring title, std::filesystem::path thumbnailPath = {});
@@ -120,6 +112,7 @@ private:
     std::map<int, TaskRecord> m_tasks;
     std::map<int, std::jthread> m_workers;
     std::vector<int> m_finishedWorkerIds;
-    std::jthread m_scheduler;
     DownloadTaskExecutor m_executor;
+    Logger* m_logger = nullptr;
+    std::jthread m_scheduler;
 };

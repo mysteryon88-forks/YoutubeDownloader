@@ -42,17 +42,11 @@ bool IsExecutableFile(const std::filesystem::path& path) {
     return !path.empty() && std::filesystem::is_regular_file(path, ec);
 }
 
-std::filesystem::path SiblingExe(const std::filesystem::path& ffmpegExe, const wchar_t* name) {
-    return ffmpegExe.parent_path() / name;
-}
-
 FfmpegStatus MakeFfmpegStatus(FfmpegSource source, const std::filesystem::path& exe) {
     FfmpegStatus status;
     status.available = true;
     status.source = source;
     status.ffmpegExe = exe;
-    status.ffprobeExe = SiblingExe(exe, L"ffprobe.exe");
-    status.binDir = exe.parent_path();
     status.message = L"FFmpeg найден";
     return status;
 }
@@ -267,7 +261,6 @@ ReleaseAssetInfo ParseGitHubReleaseAsset(const std::string& releaseJson, const s
         }
 
         info.version = NormalizeVersion(AsciiToWide(json.value("tag_name", json.value("name", ""))));
-        info.pageUrl = AsciiToWide(json.value("html_url", ""));
 
         const auto assets = json.find("assets");
         if (assets == json.end() || !assets->is_array()) {

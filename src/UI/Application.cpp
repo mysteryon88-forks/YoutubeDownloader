@@ -142,8 +142,6 @@ std::wstring TaskStateText(DownloadTaskState state) {
         return L"Подготовка";
     case DownloadTaskState::Downloading:
         return L"Скачивание";
-    case DownloadTaskState::PostProcessing:
-        return L"Обработка";
     case DownloadTaskState::Completed:
         return L"Готово";
     case DownloadTaskState::Failed:
@@ -157,8 +155,7 @@ std::wstring TaskStateText(DownloadTaskState state) {
 bool IsRunningTaskState(DownloadTaskState state) {
     return state == DownloadTaskState::Queued ||
            state == DownloadTaskState::Preparing ||
-           state == DownloadTaskState::Downloading ||
-           state == DownloadTaskState::PostProcessing;
+           state == DownloadTaskState::Downloading;
 }
 
 void AddRoundedRect(Gdiplus::GraphicsPath& path, const RECT& rect, int radius) {
@@ -594,11 +591,18 @@ void Application::Shutdown() {
     }
     m_shutdownStarted = true;
 
+    if (m_logger) {
+        m_logger->Info(L"Application shutdown started");
+    }
+
     StopAndJoin(m_previewWorker);
     StopAndJoin(m_toolCheckWorker);
     StopAndJoin(m_appUpdateWorker);
     if (m_downloadQueue) {
         m_downloadQueue->Shutdown();
+    }
+    if (m_logger) {
+        m_logger->Info(L"Application shutdown completed");
     }
 
     if (m_font) {
@@ -865,6 +869,9 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         if (LOWORD(wParam) == IdClearButton) {
             if (m_downloadQueue) {
                 const size_t removed = m_downloadQueue->ClearQueued();
+                if (m_logger) {
+                    m_logger->Info(L"Queued tasks cleared: count=" + std::to_wstring(removed));
+                }
                 SetTransientStatus(L"Очередь очищена: удалено " + std::to_wstring(removed) + L" задач");
                 RefreshQueueText();
             }
@@ -873,6 +880,9 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         if (LOWORD(wParam) == IdClearFinishedButton) {
             if (m_downloadQueue) {
                 const size_t removed = m_downloadQueue->ClearFinished();
+                if (m_logger) {
+                    m_logger->Info(L"Finished tasks cleared: count=" + std::to_wstring(removed));
+                }
                 SetTransientStatus(L"Завершённые задачи очищены: удалено " + std::to_wstring(removed) + L" задач");
                 RefreshQueueText();
             }
@@ -884,6 +894,12 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                 m_ffmpeg = FfmpegManager::Resolve(*m_paths, m_config);
                 if (m_downloadQueue) {
                     m_downloadQueue->SetMaxParallelDownloads(m_config.maxParallelDownloads);
+                }
+                if (m_logger) {
+                    m_logger->Info(
+                        L"Settings saved: max_parallel_downloads=" +
+                        std::to_wstring(m_config.maxParallelDownloads)
+                    );
                 }
                 SetTransientStatus(L"Настройки сохранены");
             }
@@ -930,14 +946,14 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                     // The tool check result should still be usable even if config persistence fails.
                 }
             }
-            if (m_ytDlpReady && m_paths) {
-                YtDlpClientOptions options;
-                options.ytDlpExePath = m_ytDlpStatus.executable;
-                options.thumbCacheDir = m_paths->thumbCacheDir();
-                options.cookiesPath = m_config.cookiesPath;
-                m_ytDlpClient = std::make_unique<YtDlpClient>(std::move(options));
-            }
             SetStatus(result->ready ? BuildToolReadyStatus(result->status, m_ffmpeg) : result->message);
+            if (m_logger) {
+                if (result->ready) {
+                    m_logger->Info(L"yt-dlp tool check completed: version=" + result->status.version);
+                } else {
+                    m_logger->Error(L"yt-dlp tool check failed: " + result->message);
+                }
+            }
         }
         return 0;
 
@@ -955,6 +971,13 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             if (m_paths && result->ok && ShouldInstallAppUpdate(result->release)) {
                 if (OfferAppUpdate(m_window, m_instance, *m_paths, result->release, false)) {
                     PostMessageW(m_window, WM_CLOSE, 0, 0);
+                }
+            }
+            if (m_logger) {
+                if (result->ok) {
+                    m_logger->Info(L"Application update check completed: version=" + result->release.version);
+                } else {
+                    m_logger->Error(L"Application update check failed: " + result->error);
                 }
             }
         }
@@ -1002,12 +1025,18 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                         RefreshQueueText();
                     }
                 }
+                if (m_logger) {
+                    m_logger->Info(L"Preview loaded: url=" + result->url);
+                }
             } else {
                 {
                     std::lock_guard lock(m_previewMutex);
                     m_preview = {};
                 }
                 SetWindowTextW(m_previewTitle, result->error.empty() ? L"Не удалось получить preview" : result->error.c_str());
+                if (m_logger) {
+                    m_logger->Error(L"Preview failed: url=" + result->url + L" error=" + result->error);
+                }
             }
             InvalidateRect(m_window, nullptr, FALSE);
         }
@@ -1410,6 +1439,7 @@ bool Application::HandleQueueClick(POINT point) {
 
         const DownloadTaskSnapshot& task = tasks[static_cast<size_t>(taskIndex)];
         bool handled = false;
+        bool removedRow = false;
         if (IsRunningTaskState(task.state) && PtInRect(&cancelButton, point)) {
             handled = m_downloadQueue->Cancel(task.id);
         } else if ((task.state == DownloadTaskState::Canceled || task.state == DownloadTaskState::Failed) &&
@@ -1418,11 +1448,15 @@ bool Application::HandleQueueClick(POINT point) {
         } else if ((task.state == DownloadTaskState::Canceled ||
                     task.state == DownloadTaskState::Failed ||
                     task.state == DownloadTaskState::Completed) &&
-                   PtInRect(&deleteButton, point)) {
+                    PtInRect(&deleteButton, point)) {
             handled = m_downloadQueue->DeleteFiles(task.id);
+            removedRow = handled;
         }
 
         if (handled) {
+            if (removedRow && m_logger) {
+                m_logger->Info(L"Task row removed: id=" + std::to_wstring(task.id));
+            }
             RefreshQueueText();
             return true;
         }
@@ -1646,13 +1680,14 @@ void Application::InitializeBackend() {
     std::filesystem::create_directories(m_paths->toolsDir(), ec);
 
     m_logger = std::make_unique<Logger>(*m_paths);
+    m_logger->Info(L"Application started: root=" + m_paths->root().wstring());
     m_config = ConfigStore::Load(*m_paths);
     if (m_folderEdit && !m_config.downloadDir.empty()) {
         SetWindowTextW(m_folderEdit, m_config.downloadDir.wstring().c_str());
     }
 
     m_ffmpeg = FfmpegManager::Resolve(*m_paths, m_config);
-    m_downloadQueue = std::make_unique<DownloadQueue>(m_config.maxParallelDownloads);
+    m_downloadQueue = std::make_unique<DownloadQueue>(m_config.maxParallelDownloads, m_logger.get());
 
     SetTimer(m_window, kQueueRefreshTimer, 500, nullptr);
     SetStatus(L"Проверка yt-dlp...");
@@ -1665,6 +1700,9 @@ void Application::StartToolCheck() {
     }
 
     StopAndJoin(m_toolCheckWorker);
+    if (m_logger) {
+        m_logger->Info(L"yt-dlp tool check started");
+    }
     const AppPaths paths = *m_paths;
     HWND window = m_window;
     m_toolCheckWorker = std::jthread([this, paths, window](std::stop_token stopToken) {
@@ -1718,6 +1756,9 @@ void Application::StartAppUpdateCheck() {
     }
 
     StopAndJoin(m_appUpdateWorker);
+    if (m_logger) {
+        m_logger->Info(L"Application update check started");
+    }
     HWND window = m_window;
     m_appUpdateWorker = std::jthread([this, window](std::stop_token stopToken) {
         AppUpdateCheckResult result;
@@ -1755,7 +1796,7 @@ void Application::StartPreviewFetch() {
         std::lock_guard lock(m_asyncResultMutex);
         m_previewFetchResult.reset();
     }
-    if (!m_ytDlpReady || !m_ytDlpClient || !m_paths) {
+    if (!m_ytDlpReady || !m_paths) {
         return;
     }
 
@@ -1776,6 +1817,9 @@ void Application::StartPreviewFetch() {
 
     const unsigned long requestId = ++m_previewRequestId;
     StartPreviewLoadingText();
+    if (m_logger) {
+        m_logger->Info(L"Preview scheduled: url=" + url);
+    }
     const YtDlpClientOptions options{m_ytDlpStatus.executable, m_paths->thumbCacheDir(), m_config.cookiesPath};
     HWND window = m_window;
     m_previewWorker = std::jthread([this, requestId, url, options, window](std::stop_token stopToken) {

@@ -16,7 +16,6 @@
 struct ReleaseAssetInfo {
     bool found = false;
     std::wstring version;
-    std::wstring pageUrl;
     std::wstring downloadUrl;
 };
 
@@ -33,8 +32,6 @@ struct FfmpegStatus {
     bool available = false;
     FfmpegSource source = FfmpegSource::Missing;
     std::filesystem::path ffmpegExe;
-    std::filesystem::path ffprobeExe;
-    std::filesystem::path binDir;
     std::wstring message;
 };
 

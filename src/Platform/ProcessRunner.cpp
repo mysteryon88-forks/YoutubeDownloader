@@ -90,48 +90,56 @@ std::wstring BuildCommandLine(const ProcessRunOptions& options) {
     return command;
 }
 
-void EmitLines(const std::wstring& text, size_t& offset, const std::function<void(const std::wstring&)>& callback) {
+std::wstring DecodeProcessBytes(const std::string& bytes) {
+    try {
+        return Utf8ToWide(bytes);
+    } catch (...) {
+        return std::wstring(bytes.begin(), bytes.end());
+    }
+}
+
+void EmitLines(
+    const std::string& bytes,
+    size_t& offset,
+    const std::function<void(const std::wstring&)>& callback,
+    bool flushFinalLine
+) {
     if (!callback) {
         return;
     }
-    size_t start = offset;
+
     while (true) {
-        const size_t newline = text.find(L'\n', start);
-        if (newline == std::wstring::npos) {
+        const size_t newline = bytes.find('\n', offset);
+        if (newline == std::string::npos) {
             break;
         }
-        std::wstring line = text.substr(offset, newline - offset);
-        if (!line.empty() && line.back() == L'\r') {
-            line.pop_back();
+
+        std::string lineBytes = bytes.substr(offset, newline - offset);
+        if (!lineBytes.empty() && lineBytes.back() == '\r') {
+            lineBytes.pop_back();
         }
-        callback(line);
-        start = newline + 1;
-        offset = start;
+        callback(DecodeProcessBytes(lineBytes));
+        offset = newline + 1;
+    }
+
+    if (flushFinalLine && offset < bytes.size()) {
+        callback(DecodeProcessBytes(bytes.substr(offset)));
+        offset = bytes.size();
     }
 }
 
 std::thread StartReader(HANDLE readHandle, std::wstring& target, const std::function<void(const std::wstring&)>& callback) {
     return std::thread([readHandle, &target, callback]() {
         std::string bytes;
+        size_t emittedOffset = 0;
         std::array<char, 4096> buffer = {};
         DWORD read = 0;
         while (ReadFile(readHandle, buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr) && read > 0) {
             bytes.append(buffer.data(), buffer.data() + read);
-            try {
-                target = Utf8ToWide(bytes);
-            } catch (...) {
-                target.assign(bytes.begin(), bytes.end());
-            }
-            size_t offset = 0;
-            EmitLines(target, offset, callback);
+            EmitLines(bytes, emittedOffset, callback, false);
         }
-        try {
-            target = Utf8ToWide(bytes);
-        } catch (...) {
-            target.assign(bytes.begin(), bytes.end());
-        }
-        size_t offset = 0;
-        EmitLines(target + L"\n", offset, callback);
+        target = DecodeProcessBytes(bytes);
+        EmitLines(bytes, emittedOffset, callback, true);
     });
 }
 

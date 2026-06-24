@@ -13,6 +13,7 @@
 ## File map
 
 - `src/Core/FileOperations.h/.cpp`: validated staged-file commit and target-preserving replacement.
+- `src/Core/AsyncWait.h/.cpp`: cancelable delay used by preview debounce.
 - `src/Core/Logger.h/.cpp`: truncate-on-start UTF-8 logger.
 - `src/Platform/ProcessRunner.cpp`: exact-once line emission.
 - `src/Platform/WinHttpClient.cpp`: staged downloads, write/length validation, cancellation cleanup, URL hardening.
@@ -302,6 +303,8 @@ git commit -m "fix: validate downloads before preserving replacement"
 ### Task 6: Own and debounce application background work
 
 **Files:**
+- Create: `src/Core/AsyncWait.h`
+- Create: `src/Core/AsyncWait.cpp`
 - Modify: `src/UI/Application.h`
 - Modify: `src/UI/Application.cpp`
 - Modify: `src/Core/ToolManagers.h`

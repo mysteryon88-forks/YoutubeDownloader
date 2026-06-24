@@ -25,6 +25,9 @@ std::wstring TimestampUtc() {
 
 Logger::Logger(std::filesystem::path logPath)
     : m_logPath(std::move(logPath)) {
+    std::error_code ec;
+    std::filesystem::create_directories(m_logPath.parent_path(), ec);
+    std::ofstream out(m_logPath, std::ios::binary | std::ios::trunc);
 }
 
 Logger::Logger(const AppPaths& paths)

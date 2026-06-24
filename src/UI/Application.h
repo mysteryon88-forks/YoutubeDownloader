@@ -17,7 +17,9 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <thread>
 
 class Application {
 public:
@@ -29,6 +31,28 @@ public:
     void Shutdown();
 
 private:
+    struct ToolCheckResult {
+        bool ready = false;
+        ToolInstallStatus status;
+        ReleaseAssetInfo latestRelease;
+        std::wstring latestCheckAt;
+        std::wstring message;
+    };
+
+    struct PreviewFetchResult {
+        unsigned long requestId = 0;
+        std::wstring url;
+        bool ok = false;
+        VideoPreview preview;
+        std::wstring error;
+    };
+
+    struct AppUpdateCheckResult {
+        bool ok = false;
+        ReleaseAssetInfo release;
+        std::wstring error;
+    };
+
     static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK ButtonWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     LRESULT HandleMessage(UINT message, WPARAM wParam, LPARAM lParam);
@@ -91,8 +115,14 @@ private:
     std::unique_ptr<Logger> m_logger;
     FfmpegStatus m_ffmpeg;
     ToolInstallStatus m_ytDlpStatus;
-    std::unique_ptr<YtDlpClient> m_ytDlpClient;
     std::unique_ptr<DownloadQueue> m_downloadQueue;
+    std::jthread m_toolCheckWorker;
+    std::jthread m_appUpdateWorker;
+    std::jthread m_previewWorker;
+    std::mutex m_asyncResultMutex;
+    std::optional<ToolCheckResult> m_toolCheckResult;
+    std::optional<AppUpdateCheckResult> m_appUpdateCheckResult;
+    std::optional<PreviewFetchResult> m_previewFetchResult;
     std::mutex m_previewMutex;
     VideoPreview m_preview;
     std::atomic<unsigned long> m_previewRequestId = 0;
@@ -102,6 +132,8 @@ private:
     bool m_transientStatusActive = false;
     bool m_previewLoading = false;
     bool m_queueMouseTracking = false;
+    bool m_shutdownStarted = false;
+    bool m_comInitialized = false;
     int m_previewLoadingDots = 3;
     int m_hotQueueTaskId = 0;
     int m_hotQueueAction = 0;

@@ -1,5 +1,6 @@
 #include "Application.h"
 
+#include "AsyncWait.h"
 #include "BackendText.h"
 #include "DialogWindows.h"
 #include "KeyboardShortcuts.h"
@@ -15,14 +16,13 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <functional>
 #include <system_error>
 #include <thread>
 #include <vector>
-
-#include "ProcessRunner.h"
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "gdiplus.lib")
@@ -71,27 +71,31 @@ struct ButtonState {
     std::wstring text;
 };
 
-struct ToolCheckResult {
-    bool ready = false;
-    ToolInstallStatus status;
-    ReleaseAssetInfo latestRelease;
-    std::wstring latestCheckAt;
-    std::wstring message;
+class UniqueHandle {
+public:
+    explicit UniqueHandle(HANDLE handle = nullptr) : m_handle(handle) {}
+    ~UniqueHandle() {
+        if (m_handle && m_handle != INVALID_HANDLE_VALUE) {
+            CloseHandle(m_handle);
+        }
+    }
+
+    UniqueHandle(const UniqueHandle&) = delete;
+    UniqueHandle& operator=(const UniqueHandle&) = delete;
+
+    HANDLE get() const { return m_handle; }
+
+private:
+    HANDLE m_handle = nullptr;
 };
 
-struct PreviewFetchResult {
-    unsigned long requestId = 0;
-    std::wstring url;
-    bool ok = false;
-    VideoPreview preview;
-    std::wstring error;
-};
-
-struct AppUpdateCheckResult {
-    bool ok = false;
-    ReleaseAssetInfo release;
-    std::wstring error;
-};
+void StopAndJoin(std::jthread& worker) {
+    if (!worker.joinable()) {
+        return;
+    }
+    worker.request_stop();
+    worker.join();
+}
 
 HWND CreateChild(HWND parent, const wchar_t* className, const wchar_t* text, DWORD style, DWORD exStyle, int id) {
     return CreateWindowExW(
@@ -138,8 +142,6 @@ std::wstring TaskStateText(DownloadTaskState state) {
         return L"Подготовка";
     case DownloadTaskState::Downloading:
         return L"Скачивание";
-    case DownloadTaskState::PostProcessing:
-        return L"Обработка";
     case DownloadTaskState::Completed:
         return L"Готово";
     case DownloadTaskState::Failed:
@@ -153,8 +155,7 @@ std::wstring TaskStateText(DownloadTaskState state) {
 bool IsRunningTaskState(DownloadTaskState state) {
     return state == DownloadTaskState::Queued ||
            state == DownloadTaskState::Preparing ||
-           state == DownloadTaskState::Downloading ||
-           state == DownloadTaskState::PostProcessing;
+           state == DownloadTaskState::Downloading;
 }
 
 void AddRoundedRect(Gdiplus::GraphicsPath& path, const RECT& rect, int radius) {
@@ -585,6 +586,25 @@ void Application::RelayTooltipMessage(const MSG& message) {
 }
 
 void Application::Shutdown() {
+    if (m_shutdownStarted) {
+        return;
+    }
+    m_shutdownStarted = true;
+
+    if (m_logger) {
+        m_logger->Info(L"Application shutdown started");
+    }
+
+    StopAndJoin(m_previewWorker);
+    StopAndJoin(m_toolCheckWorker);
+    StopAndJoin(m_appUpdateWorker);
+    if (m_downloadQueue) {
+        m_downloadQueue->Shutdown();
+    }
+    if (m_logger) {
+        m_logger->Info(L"Application shutdown completed");
+    }
+
     if (m_font) {
         DeleteObject(m_font);
         m_font = nullptr;
@@ -609,10 +629,10 @@ void Application::Shutdown() {
         Gdiplus::GdiplusShutdown(m_gdiplusToken);
         m_gdiplusToken = 0;
     }
-    if (m_downloadQueue) {
-        m_downloadQueue->Shutdown();
+    if (m_comInitialized) {
+        CoUninitialize();
+        m_comInitialized = false;
     }
-    CoUninitialize();
 }
 
 LRESULT CALLBACK Application::WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -849,6 +869,9 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         if (LOWORD(wParam) == IdClearButton) {
             if (m_downloadQueue) {
                 const size_t removed = m_downloadQueue->ClearQueued();
+                if (m_logger) {
+                    m_logger->Info(L"Queued tasks cleared: count=" + std::to_wstring(removed));
+                }
                 SetTransientStatus(L"Очередь очищена: удалено " + std::to_wstring(removed) + L" задач");
                 RefreshQueueText();
             }
@@ -857,6 +880,9 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         if (LOWORD(wParam) == IdClearFinishedButton) {
             if (m_downloadQueue) {
                 const size_t removed = m_downloadQueue->ClearFinished();
+                if (m_logger) {
+                    m_logger->Info(L"Finished tasks cleared: count=" + std::to_wstring(removed));
+                }
                 SetTransientStatus(L"Завершённые задачи очищены: удалено " + std::to_wstring(removed) + L" задач");
                 RefreshQueueText();
             }
@@ -866,6 +892,15 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             if (m_paths && ShowSettingsDialog(m_window, m_instance, *m_paths, m_config)) {
                 ConfigStore::Save(*m_paths, m_config);
                 m_ffmpeg = FfmpegManager::Resolve(*m_paths, m_config);
+                if (m_downloadQueue) {
+                    m_downloadQueue->SetMaxParallelDownloads(m_config.maxParallelDownloads);
+                }
+                if (m_logger) {
+                    m_logger->Info(
+                        L"Settings saved: max_parallel_downloads=" +
+                        std::to_wstring(m_config.maxParallelDownloads)
+                    );
+                }
                 SetTransientStatus(L"Настройки сохранены");
             }
             return 0;
@@ -891,35 +926,58 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
 
     case kMsgToolCheckComplete:
         {
-            std::unique_ptr<ToolCheckResult> result(reinterpret_cast<ToolCheckResult*>(lParam));
-            m_ytDlpReady = result->ready;
-            m_ytDlpStatus = result->status;
-            if (m_paths && result->latestRelease.found && !result->latestCheckAt.empty()) {
-                m_config.lastYtDlpCheckAt = result->latestCheckAt;
-                m_config.lastYtDlpVersion = result->latestRelease.version;
+            ToolCheckResult result;
+            {
+                std::lock_guard lock(m_asyncResultMutex);
+                if (!m_toolCheckResult) {
+                    return 0;
+                }
+                result = std::move(*m_toolCheckResult);
+                m_toolCheckResult.reset();
+            }
+            m_ytDlpReady = result.ready;
+            m_ytDlpStatus = result.status;
+            if (m_paths && result.latestRelease.found && !result.latestCheckAt.empty()) {
+                m_config.lastYtDlpCheckAt = result.latestCheckAt;
+                m_config.lastYtDlpVersion = result.latestRelease.version;
                 try {
                     ConfigStore::Save(*m_paths, m_config);
                 } catch (...) {
                     // The tool check result should still be usable even if config persistence fails.
                 }
             }
-            if (m_ytDlpReady && m_paths) {
-                YtDlpClientOptions options;
-                options.ytDlpExePath = m_ytDlpStatus.executable;
-                options.thumbCacheDir = m_paths->thumbCacheDir();
-                options.cookiesPath = m_config.cookiesPath;
-                m_ytDlpClient = std::make_unique<YtDlpClient>(std::move(options));
+            SetStatus(result.ready ? BuildToolReadyStatus(result.status, m_ffmpeg) : result.message);
+            if (m_logger) {
+                if (result.ready) {
+                    m_logger->Info(L"yt-dlp tool check completed: version=" + result.status.version);
+                } else {
+                    m_logger->Error(L"yt-dlp tool check failed: " + result.message);
+                }
             }
-            SetStatus(result->ready ? BuildToolReadyStatus(result->status, m_ffmpeg) : result->message);
         }
         return 0;
 
     case kMsgAppUpdateCheckComplete:
         {
-            std::unique_ptr<AppUpdateCheckResult> result(reinterpret_cast<AppUpdateCheckResult*>(lParam));
-            if (m_paths && result->ok && ShouldInstallAppUpdate(result->release)) {
-                if (OfferAppUpdate(m_window, m_instance, *m_paths, result->release, false)) {
+            AppUpdateCheckResult result;
+            {
+                std::lock_guard lock(m_asyncResultMutex);
+                if (!m_appUpdateCheckResult) {
+                    return 0;
+                }
+                result = std::move(*m_appUpdateCheckResult);
+                m_appUpdateCheckResult.reset();
+            }
+            if (m_paths && result.ok && ShouldInstallAppUpdate(result.release)) {
+                if (OfferAppUpdate(m_window, m_instance, *m_paths, result.release, false)) {
                     PostMessageW(m_window, WM_CLOSE, 0, 0);
+                }
+            }
+            if (m_logger) {
+                if (result.ok) {
+                    m_logger->Info(L"Application update check completed: version=" + result.release.version);
+                } else {
+                    m_logger->Error(L"Application update check failed: " + result.error);
                 }
             }
         }
@@ -927,44 +985,58 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
 
     case kMsgPreviewComplete:
         {
-            std::unique_ptr<PreviewFetchResult> result(reinterpret_cast<PreviewFetchResult*>(lParam));
-            if (result->requestId != m_previewRequestId.load()) {
+            PreviewFetchResult result;
+            {
+                std::lock_guard lock(m_asyncResultMutex);
+                if (!m_previewFetchResult) {
+                    return 0;
+                }
+                result = std::move(*m_previewFetchResult);
+                m_previewFetchResult.reset();
+            }
+            if (result.requestId != m_previewRequestId.load()) {
                 return 0;
             }
             StopPreviewLoadingText();
-            if (result->ok) {
+            if (result.ok) {
                 {
                     std::lock_guard lock(m_previewMutex);
-                    m_preview = result->preview;
+                    m_preview = result.preview;
                 }
-                std::wstring title = result->preview.title.empty() ? L"Видео найдено" : result->preview.title;
-                if (result->preview.isPlaylist) {
-                    title += L" — плейлист: " + std::to_wstring(result->preview.entries.size()) + L" видео";
+                std::wstring title = result.preview.title.empty() ? L"Видео найдено" : result.preview.title;
+                if (result.preview.isPlaylist) {
+                    title += L" — плейлист: " + std::to_wstring(result.preview.entries.size()) + L" видео";
                 }
                 SetWindowTextW(m_previewTitle, title.c_str());
                 if (m_downloadQueue) {
                     bool enriched = m_downloadQueue->EnrichMetadata(
-                        result->url,
-                        result->preview.title,
-                        result->preview.cachedThumbnailPath
+                        result.url,
+                        result.preview.title,
+                        result.preview.cachedThumbnailPath
                     );
-                    if (!result->preview.webpageUrl.empty() && result->preview.webpageUrl != result->url) {
+                    if (!result.preview.webpageUrl.empty() && result.preview.webpageUrl != result.url) {
                         enriched = m_downloadQueue->EnrichMetadata(
-                            result->preview.webpageUrl,
-                            result->preview.title,
-                            result->preview.cachedThumbnailPath
+                            result.preview.webpageUrl,
+                            result.preview.title,
+                            result.preview.cachedThumbnailPath
                         ) || enriched;
                     }
                     if (enriched) {
                         RefreshQueueText();
                     }
                 }
+                if (m_logger) {
+                    m_logger->Info(L"Preview loaded: url=" + result.url);
+                }
             } else {
                 {
                     std::lock_guard lock(m_previewMutex);
                     m_preview = {};
                 }
-                SetWindowTextW(m_previewTitle, result->error.empty() ? L"Не удалось получить preview" : result->error.c_str());
+                SetWindowTextW(m_previewTitle, result.error.empty() ? L"Не удалось получить preview" : result.error.c_str());
+                if (m_logger) {
+                    m_logger->Error(L"Preview failed: url=" + result.url + L" error=" + result.error);
+                }
             }
             InvalidateRect(m_window, nullptr, FALSE);
         }
@@ -1367,6 +1439,7 @@ bool Application::HandleQueueClick(POINT point) {
 
         const DownloadTaskSnapshot& task = tasks[static_cast<size_t>(taskIndex)];
         bool handled = false;
+        bool removedRow = false;
         if (IsRunningTaskState(task.state) && PtInRect(&cancelButton, point)) {
             handled = m_downloadQueue->Cancel(task.id);
         } else if ((task.state == DownloadTaskState::Canceled || task.state == DownloadTaskState::Failed) &&
@@ -1375,11 +1448,15 @@ bool Application::HandleQueueClick(POINT point) {
         } else if ((task.state == DownloadTaskState::Canceled ||
                     task.state == DownloadTaskState::Failed ||
                     task.state == DownloadTaskState::Completed) &&
-                   PtInRect(&deleteButton, point)) {
+                    PtInRect(&deleteButton, point)) {
             handled = m_downloadQueue->DeleteFiles(task.id);
+            removedRow = handled;
         }
 
         if (handled) {
+            if (removedRow && m_logger) {
+                m_logger->Info(L"Task row removed: id=" + std::to_wstring(task.id));
+            }
             RefreshQueueText();
             return true;
         }
@@ -1594,7 +1671,7 @@ void Application::UpdatePreviewLoadingText() {
 }
 
 void Application::InitializeBackend() {
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    m_comInitialized = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
 
     m_paths = std::make_unique<AppPaths>(GetExecutableRoot());
     std::error_code ec;
@@ -1603,70 +1680,14 @@ void Application::InitializeBackend() {
     std::filesystem::create_directories(m_paths->toolsDir(), ec);
 
     m_logger = std::make_unique<Logger>(*m_paths);
+    m_logger->Info(L"Application started: root=" + m_paths->root().wstring());
     m_config = ConfigStore::Load(*m_paths);
     if (m_folderEdit && !m_config.downloadDir.empty()) {
         SetWindowTextW(m_folderEdit, m_config.downloadDir.wstring().c_str());
     }
 
     m_ffmpeg = FfmpegManager::Resolve(*m_paths, m_config);
-    m_downloadQueue = std::make_unique<DownloadQueue>(m_config.maxParallelDownloads);
-    m_downloadQueue->SetExecutor([this](const DownloadTaskSnapshot& task, const DownloadTaskCallbacks& callbacks) {
-        ProcessRunOptions options;
-        options.executable = task.request.ytDlpExePath;
-        options.arguments = BuildDownloadArguments(task.request);
-        options.timeoutMs = INFINITE;
-
-        HANDLE cancelEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        std::atomic<bool> monitorDone = false;
-        std::thread cancelMonitor([&]() {
-            while (!monitorDone.load()) {
-                if (callbacks.isCanceled && callbacks.isCanceled()) {
-                    SetEvent(cancelEvent);
-                    break;
-                }
-                Sleep(50);
-            }
-        });
-        options.cancelEvent = cancelEvent;
-        options.onStdoutLine = [callbacks](const std::wstring& line) {
-            if (callbacks.onOutputLine) {
-                callbacks.onOutputLine(line);
-            }
-            const YtDlpProgress progress = ParseYtDlpProgressLine(line);
-            if (progress.recognized && callbacks.onProgressDetails) {
-                callbacks.onProgressDetails(progress);
-            }
-        };
-        options.onStderrLine = callbacks.onOutputLine;
-
-        ProcessRunResult result;
-        try {
-            result = ProcessRunner::Run(options);
-        } catch (const std::exception& ex) {
-            monitorDone = true;
-            SetEvent(cancelEvent);
-            if (cancelMonitor.joinable()) {
-                cancelMonitor.join();
-            }
-            CloseHandle(cancelEvent);
-            return DownloadTaskResult{false, std::wstring(ex.what(), ex.what() + std::strlen(ex.what())), {}};
-        }
-
-        monitorDone = true;
-        SetEvent(cancelEvent);
-        if (cancelMonitor.joinable()) {
-            cancelMonitor.join();
-        }
-        CloseHandle(cancelEvent);
-
-        if (result.canceled) {
-            return DownloadTaskResult{false, L"Отменено", {}};
-        }
-        if (result.exitCode != 0) {
-            return DownloadTaskResult{false, result.stderrText.empty() ? result.stdoutText : result.stderrText, {}};
-        }
-        return DownloadTaskResult{true, L"", {}};
-    });
+    m_downloadQueue = std::make_unique<DownloadQueue>(m_config.maxParallelDownloads, m_logger.get());
 
     SetTimer(m_window, kQueueRefreshTimer, 500, nullptr);
     SetStatus(L"Проверка yt-dlp...");
@@ -1678,38 +1699,55 @@ void Application::StartToolCheck() {
         return;
     }
 
+    StopAndJoin(m_toolCheckWorker);
+    if (m_logger) {
+        m_logger->Info(L"yt-dlp tool check started");
+    }
     const AppPaths paths = *m_paths;
     HWND window = m_window;
-    std::thread([paths, window]() {
-        auto* result = new ToolCheckResult{};
+    m_toolCheckWorker = std::jthread([this, paths, window](std::stop_token stopToken) {
+        ToolCheckResult result;
+        UniqueHandle cancelEvent(CreateEventW(nullptr, TRUE, FALSE, nullptr));
         try {
+            if (!cancelEvent.get()) {
+                throw std::runtime_error("failed to create tool check cancellation event");
+            }
+            std::stop_callback stopCallback(stopToken, [handle = cancelEvent.get()]() {
+                SetEvent(handle);
+            });
             YtDlpManager manager(paths);
-            result->status = manager.Status();
+            result.status = manager.Status();
             try {
-                result->latestRelease = manager.CheckLatestRelease();
-                result->latestCheckAt = CurrentUtcTimestamp();
-                if (ShouldInstallYtDlpUpdate(result->status, result->latestRelease)) {
-                    result->message = result->status.installed ? L"Обновление yt-dlp..." : L"Установка yt-dlp...";
-                    result->status = manager.InstallOrUpdate();
+                result.latestRelease = manager.CheckLatestRelease(cancelEvent.get());
+                result.latestCheckAt = CurrentUtcTimestamp();
+                if (ShouldInstallYtDlpUpdate(result.status, result.latestRelease)) {
+                    result.status = manager.InstallOrUpdate(cancelEvent.get());
                 }
             } catch (...) {
-                if (!result->status.installed) {
+                if (!result.status.installed) {
                     throw;
                 }
             }
-            result->ready = result->status.installed;
-            result->message = result->ready
-                ? L"yt-dlp готов" + (result->status.version.empty() ? L"" : L" (" + result->status.version + L")")
+            result.ready = result.status.installed;
+            result.message = result.ready
+                ? L"yt-dlp готов" + (result.status.version.empty() ? L"" : L" (" + result.status.version + L")")
                 : L"yt-dlp не найден";
         } catch (const std::exception& ex) {
-            result->ready = false;
-            result->message = L"Ошибка подготовки yt-dlp: " + std::wstring(ex.what(), ex.what() + std::strlen(ex.what()));
+            result.ready = false;
+            result.message = L"Ошибка подготовки yt-dlp: " + std::wstring(ex.what(), ex.what() + std::strlen(ex.what()));
         } catch (...) {
-            result->ready = false;
-            result->message = L"Ошибка подготовки yt-dlp";
+            result.ready = false;
+            result.message = L"Ошибка подготовки yt-dlp";
         }
-        PostMessageW(window, kMsgToolCheckComplete, 0, reinterpret_cast<LPARAM>(result));
-    }).detach();
+        if (stopToken.stop_requested()) {
+            return;
+        }
+        {
+            std::lock_guard lock(m_asyncResultMutex);
+            m_toolCheckResult = std::move(result);
+        }
+        PostMessageW(window, kMsgToolCheckComplete, 0, 0);
+    });
 }
 
 void Application::StartAppUpdateCheck() {
@@ -1717,25 +1755,48 @@ void Application::StartAppUpdateCheck() {
         return;
     }
 
+    StopAndJoin(m_appUpdateWorker);
+    if (m_logger) {
+        m_logger->Info(L"Application update check started");
+    }
     HWND window = m_window;
-    std::thread([window]() {
-        auto* result = new AppUpdateCheckResult{};
+    m_appUpdateWorker = std::jthread([this, window](std::stop_token stopToken) {
+        AppUpdateCheckResult result;
+        UniqueHandle cancelEvent(CreateEventW(nullptr, TRUE, FALSE, nullptr));
         try {
-            result->release = AppUpdateService::CheckLatestRelease();
-            result->ok = true;
+            if (!cancelEvent.get()) {
+                throw std::runtime_error("failed to create app update cancellation event");
+            }
+            std::stop_callback stopCallback(stopToken, [handle = cancelEvent.get()]() {
+                SetEvent(handle);
+            });
+            result.release = AppUpdateService::CheckLatestRelease(cancelEvent.get());
+            result.ok = true;
         } catch (const std::exception& ex) {
-            result->ok = false;
-            result->error = std::wstring(ex.what(), ex.what() + std::strlen(ex.what()));
+            result.ok = false;
+            result.error = std::wstring(ex.what(), ex.what() + std::strlen(ex.what()));
         } catch (...) {
-            result->ok = false;
-            result->error = L"Неизвестная ошибка проверки обновлений";
+            result.ok = false;
+            result.error = L"Неизвестная ошибка проверки обновлений";
         }
-        PostMessageW(window, kMsgAppUpdateCheckComplete, 0, reinterpret_cast<LPARAM>(result));
-    }).detach();
+        if (stopToken.stop_requested()) {
+            return;
+        }
+        {
+            std::lock_guard lock(m_asyncResultMutex);
+            m_appUpdateCheckResult = std::move(result);
+        }
+        PostMessageW(window, kMsgAppUpdateCheckComplete, 0, 0);
+    });
 }
 
 void Application::StartPreviewFetch() {
-    if (!m_ytDlpReady || !m_ytDlpClient || !m_paths) {
+    StopAndJoin(m_previewWorker);
+    {
+        std::lock_guard lock(m_asyncResultMutex);
+        m_previewFetchResult.reset();
+    }
+    if (!m_ytDlpReady || !m_paths) {
         return;
     }
 
@@ -1756,28 +1817,49 @@ void Application::StartPreviewFetch() {
 
     const unsigned long requestId = ++m_previewRequestId;
     StartPreviewLoadingText();
+    if (m_logger) {
+        m_logger->Info(L"Preview scheduled: url=" + url);
+    }
     const YtDlpClientOptions options{m_ytDlpStatus.executable, m_paths->thumbCacheDir(), m_config.cookiesPath};
     HWND window = m_window;
-    std::thread([requestId, url, options, window]() {
-        auto* result = new PreviewFetchResult{};
-        result->requestId = requestId;
-        result->url = url;
-        try {
-            YtDlpClient client(options);
-            result->preview = client.FetchPreview(url);
-            if (!result->preview.thumbnailUrl.empty()) {
-                result->preview.cachedThumbnailPath = client.CacheThumbnail(result->preview);
-            }
-            result->ok = true;
-        } catch (const std::exception& ex) {
-            result->ok = false;
-            result->error = L"Preview недоступен: " + std::wstring(ex.what(), ex.what() + std::strlen(ex.what()));
-        } catch (...) {
-            result->ok = false;
-            result->error = L"Preview недоступен";
+    m_previewWorker = std::jthread([this, requestId, url, options, window](std::stop_token stopToken) {
+        if (!WaitForDelay(stopToken, std::chrono::milliseconds(300))) {
+            return;
         }
-        PostMessageW(window, kMsgPreviewComplete, 0, reinterpret_cast<LPARAM>(result));
-    }).detach();
+
+        PreviewFetchResult result;
+        result.requestId = requestId;
+        result.url = url;
+        UniqueHandle cancelEvent(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+        try {
+            if (!cancelEvent.get()) {
+                throw std::runtime_error("failed to create preview cancellation event");
+            }
+            std::stop_callback stopCallback(stopToken, [handle = cancelEvent.get()]() {
+                SetEvent(handle);
+            });
+            YtDlpClient client(options);
+            result.preview = client.FetchPreview(url, cancelEvent.get());
+            if (!result.preview.thumbnailUrl.empty()) {
+                result.preview.cachedThumbnailPath = client.CacheThumbnail(result.preview, cancelEvent.get());
+            }
+            result.ok = true;
+        } catch (const std::exception& ex) {
+            result.ok = false;
+            result.error = L"Preview недоступен: " + std::wstring(ex.what(), ex.what() + std::strlen(ex.what()));
+        } catch (...) {
+            result.ok = false;
+            result.error = L"Preview недоступен";
+        }
+        if (stopToken.stop_requested()) {
+            return;
+        }
+        {
+            std::lock_guard lock(m_asyncResultMutex);
+            m_previewFetchResult = std::move(result);
+        }
+        PostMessageW(window, kMsgPreviewComplete, 0, 0);
+    });
 }
 
 void Application::EnqueueCurrentUrl() {

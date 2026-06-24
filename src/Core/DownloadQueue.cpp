@@ -1,5 +1,6 @@
 #include "DownloadQueue.h"
 
+#include "Logger.h"
 #include "ProcessRunner.h"
 
 #include <algorithm>
@@ -189,11 +190,16 @@ bool EnrichTaskMetadata(DownloadTaskSnapshot& task, std::wstring title, std::fil
 
 } // namespace
 
-DownloadQueue::DownloadQueue(int maxParallelDownloads)
+DownloadQueue::DownloadQueue(int maxParallelDownloads, Logger* logger)
     : m_maxParallelDownloads(std::max(1, maxParallelDownloads)),
-      m_executor([this](const DownloadTaskSnapshot& task, const DownloadTaskCallbacks& callbacks) {
-          return DefaultExecutor(task, callbacks);
+      m_executor([this](
+          const DownloadTaskSnapshot& task,
+          std::stop_token stopToken,
+          const DownloadTaskCallbacks& callbacks
+      ) {
+          return DefaultExecutor(task, stopToken, callbacks);
       }),
+      m_logger(logger),
       m_scheduler(&DownloadQueue::SchedulerLoop, this) {
 }
 
@@ -204,6 +210,14 @@ DownloadQueue::~DownloadQueue() {
 void DownloadQueue::SetExecutor(DownloadTaskExecutor executor) {
     std::lock_guard lock(m_mutex);
     m_executor = std::move(executor);
+}
+
+void DownloadQueue::SetMaxParallelDownloads(int maxParallelDownloads) {
+    {
+        std::lock_guard lock(m_mutex);
+        m_maxParallelDownloads = std::max(1, maxParallelDownloads);
+    }
+    m_cv.notify_all();
 }
 
 int DownloadQueue::Enqueue(const YtDlpDownloadRequest& request, std::wstring title, std::filesystem::path thumbnailPath) {
@@ -226,6 +240,9 @@ int DownloadQueue::Enqueue(const YtDlpDownloadRequest& request, std::wstring tit
     record.snapshot.state = DownloadTaskState::Queued;
     record.snapshot.statusText = L"В очереди";
     m_tasks[id] = std::move(record);
+    if (m_logger) {
+        m_logger->Info(L"Download task enqueued: id=" + std::to_wstring(id) + L" url=" + request.url);
+    }
     ++m_revision;
     m_cv.notify_all();
     return id;
@@ -235,11 +252,14 @@ bool DownloadQueue::EnrichMetadata(const std::wstring& url, std::wstring title, 
     std::lock_guard lock(m_mutex);
     for (auto& [id, task] : m_tasks) {
         UNREFERENCED_PARAMETER(id);
-        if (task.snapshot.request.url == url &&
-            EnrichTaskMetadata(task.snapshot, std::move(title), std::move(thumbnailPath))) {
+        if (task.snapshot.request.url != url) {
+            continue;
+        }
+        if (EnrichTaskMetadata(task.snapshot, std::move(title), std::move(thumbnailPath))) {
             ++m_revision;
             return true;
         }
+        return false;
     }
     return false;
 }
@@ -254,6 +274,9 @@ bool DownloadQueue::Cancel(int id) {
     if (task.snapshot.state == DownloadTaskState::Queued) {
         task.snapshot.state = DownloadTaskState::Canceled;
         task.snapshot.statusText = L"Отменено";
+        if (m_logger) {
+            m_logger->Info(L"Download task canceled while queued: id=" + std::to_wstring(id));
+        }
         ++m_revision;
         m_cv.notify_all();
         return true;
@@ -261,6 +284,13 @@ bool DownloadQueue::Cancel(int id) {
     if (task.active) {
         task.cancelRequested = true;
         task.snapshot.statusText = L"Отмена...";
+        if (m_logger) {
+            m_logger->Info(L"Download task cancellation requested: id=" + std::to_wstring(id));
+        }
+        const auto worker = m_workers.find(id);
+        if (worker != m_workers.end()) {
+            worker->second.request_stop();
+        }
         ++m_revision;
         return true;
     }
@@ -283,7 +313,6 @@ bool DownloadQueue::Retry(int id) {
     task.snapshot.percent = 0.0;
     task.snapshot.errorText.clear();
     task.snapshot.statusText = L"В очереди";
-    task.snapshot.lastOutputLine.clear();
     task.snapshot.downloadedBytes = 0;
     task.snapshot.totalBytes = 0;
     task.snapshot.speedBytesPerSecond = 0;
@@ -292,6 +321,9 @@ bool DownloadQueue::Retry(int id) {
     task.snapshot.formatId.clear();
     task.snapshot.extension.clear();
     task.snapshot.resolution.clear();
+    if (m_logger) {
+        m_logger->Info(L"Download task retried: id=" + std::to_wstring(id));
+    }
     ++m_revision;
     m_cv.notify_all();
     return true;
@@ -393,6 +425,7 @@ void DownloadQueue::WaitForIdle() {
 }
 
 void DownloadQueue::Shutdown() {
+    std::map<int, std::jthread> workers;
     {
         std::lock_guard lock(m_mutex);
         if (m_shutdown) {
@@ -403,138 +436,114 @@ void DownloadQueue::Shutdown() {
             UNREFERENCED_PARAMETER(id);
             task.cancelRequested = true;
         }
+        for (auto& [id, worker] : m_workers) {
+            UNREFERENCED_PARAMETER(id);
+            worker.request_stop();
+        }
     }
     m_cv.notify_all();
     if (m_scheduler.joinable()) {
+        m_scheduler.request_stop();
         m_scheduler.join();
     }
+    {
+        std::lock_guard lock(m_mutex);
+        workers = std::move(m_workers);
+        m_finishedWorkerIds.clear();
+    }
+    for (auto& [id, worker] : workers) {
+        UNREFERENCED_PARAMETER(id);
+        worker.request_stop();
+    }
+    workers.clear();
 }
 
 void DownloadQueue::SchedulerLoop() {
     while (true) {
-        std::unique_lock lock(m_mutex);
-        m_cv.wait(lock, [this]() {
-            if (m_shutdown) {
-                return true;
-            }
-            if (m_activeCount >= m_maxParallelDownloads) {
-                return false;
-            }
-            return std::any_of(m_tasks.begin(), m_tasks.end(), [](const auto& item) {
-                return item.second.snapshot.state == DownloadTaskState::Queued;
+        std::vector<std::jthread> finished;
+        {
+            std::unique_lock schedulerLock(m_mutex);
+            m_cv.wait(schedulerLock, [this]() {
+                if (m_shutdown || !m_finishedWorkerIds.empty()) {
+                    return true;
+                }
+                if (m_activeCount >= m_maxParallelDownloads) {
+                    return false;
+                }
+                return std::any_of(m_tasks.begin(), m_tasks.end(), [](const auto& item) {
+                    return item.second.snapshot.state == DownloadTaskState::Queued;
+                });
             });
-        });
 
+            if (m_shutdown) {
+                break;
+            }
+
+            finished.reserve(m_finishedWorkerIds.size());
+            for (int id : m_finishedWorkerIds) {
+                auto worker = m_workers.find(id);
+                if (worker == m_workers.end()) {
+                    continue;
+                }
+                finished.push_back(std::move(worker->second));
+                m_workers.erase(worker);
+            }
+            m_finishedWorkerIds.clear();
+        }
+
+        finished.clear();
+
+        std::lock_guard schedulerLock(m_mutex);
         if (m_shutdown) {
             break;
         }
-
         while (m_activeCount < m_maxParallelDownloads) {
-            auto it = std::find_if(m_tasks.begin(), m_tasks.end(), [](const auto& item) {
+            auto nextTask = std::find_if(m_tasks.begin(), m_tasks.end(), [](const auto& item) {
                 return item.second.snapshot.state == DownloadTaskState::Queued;
             });
-            if (it == m_tasks.end()) {
+            if (nextTask == m_tasks.end()) {
                 break;
             }
-            const int id = it->first;
-            it->second.active = true;
-            it->second.snapshot.state = DownloadTaskState::Preparing;
-            it->second.snapshot.statusText = L"Подготовка";
+            const int id = nextTask->first;
+            nextTask->second.active = true;
+            nextTask->second.snapshot.state = DownloadTaskState::Preparing;
+            nextTask->second.snapshot.statusText = L"Подготовка";
             ++m_revision;
             ++m_activeCount;
-            std::thread(&DownloadQueue::StartTask, this, id).detach();
+            m_workers.emplace(id, std::jthread([this, id](std::stop_token stopToken) {
+                StartTask(id, stopToken);
+            }));
         }
     }
 }
 
-void DownloadQueue::StartTask(int id) {
+void DownloadQueue::StartTask(int id, std::stop_token stopToken) {
     DownloadTaskSnapshot task;
     DownloadTaskExecutor executor;
+    bool found = false;
     {
-        std::lock_guard lock(m_mutex);
+        std::lock_guard taskLock(m_mutex);
         auto it = m_tasks.find(id);
-        if (it == m_tasks.end()) {
-            return;
+        if (it != m_tasks.end()) {
+            task = it->second.snapshot;
+            executor = m_executor;
+            found = true;
         }
-        task = it->second.snapshot;
-        executor = m_executor;
+    }
+    if (!found) {
+        return;
     }
 
     DownloadTaskCallbacks callbacks;
-    callbacks.onProgress = [this, id](double percent, const std::wstring& status) {
-        std::lock_guard lock(m_mutex);
-        auto it = m_tasks.find(id);
-        if (it == m_tasks.end()) {
-            return;
-        }
-        it->second.snapshot.state = DownloadTaskState::Downloading;
-        it->second.snapshot.percent = std::max(it->second.snapshot.percent, std::clamp(percent, 0.0, 100.0));
-        it->second.snapshot.statusText = status;
-        ++m_revision;
-    };
     callbacks.onProgressDetails = [this, id](const YtDlpProgress& progress) {
-        std::lock_guard lock(m_mutex);
-        auto it = m_tasks.find(id);
-        if (it == m_tasks.end()) {
-            return;
-        }
-        DownloadTaskSnapshot& snapshot = it->second.snapshot;
-        if (snapshot.mediaKind == L"audio" && progress.mediaKind != L"audio") {
-            return;
-        }
-        const bool switchedTrack =
-            !snapshot.mediaKind.empty() &&
-            !progress.mediaKind.empty() &&
-            snapshot.mediaKind != progress.mediaKind;
-
-        it->second.snapshot.state = DownloadTaskState::Downloading;
-        it->second.snapshot.statusText = progress.stage;
-        const std::uint64_t diskBytes = DiskBytesForPaths(snapshot.outputFiles);
-        const std::uint64_t reportedBytes = diskBytes > 0 ? diskBytes : progress.downloadedBytes;
-        if (switchedTrack) {
-            snapshot.percent = std::clamp(progress.percent, 0.0, 100.0);
-            snapshot.downloadedBytes = reportedBytes;
-            snapshot.totalBytes = std::max(progress.totalBytes, reportedBytes);
-        } else {
-            snapshot.downloadedBytes = std::max(snapshot.downloadedBytes, reportedBytes);
-            snapshot.totalBytes = std::max({snapshot.totalBytes, progress.totalBytes, snapshot.downloadedBytes});
-            double normalizedPercent = std::clamp(progress.percent, 0.0, 100.0);
-            if (snapshot.totalBytes > 0) {
-                normalizedPercent = std::max(
-                    normalizedPercent,
-                    (static_cast<double>(snapshot.downloadedBytes) / static_cast<double>(snapshot.totalBytes)) * 100.0
-                );
-            }
-            snapshot.percent = std::max(snapshot.percent, std::clamp(normalizedPercent, 0.0, 100.0));
-        }
-        snapshot.speedBytesPerSecond = progress.speedBytesPerSecond;
-        snapshot.etaSeconds = progress.etaSeconds;
-        if (!progress.mediaKind.empty()) {
-            snapshot.mediaKind = progress.mediaKind;
-        }
-        snapshot.formatId = progress.formatId;
-        snapshot.extension = progress.extension;
-        snapshot.resolution = progress.resolution;
-        ++m_revision;
+        UpdateTaskProgress(id, progress);
     };
     callbacks.onOutputLine = [this, id](const std::wstring& line) {
-        std::lock_guard lock(m_mutex);
-        auto it = m_tasks.find(id);
-        if (it != m_tasks.end()) {
-            it->second.snapshot.lastOutputLine = line;
-            AddUniquePath(it->second.snapshot.outputFiles, ExtractKnownOutputPath(line));
-            ++m_revision;
-        }
+        RecordTaskOutput(id, line);
     };
-    callbacks.isCanceled = [this, id]() {
-        std::lock_guard lock(m_mutex);
-        auto it = m_tasks.find(id);
-        return it == m_tasks.end() || it->second.cancelRequested || m_shutdown;
-    };
-
     DownloadTaskResult result;
     try {
-        result = executor(task, callbacks);
+        result = executor(task, stopToken, callbacks);
     } catch (const std::exception& ex) {
         result.success = false;
         result.errorText.assign(ex.what(), ex.what() + std::strlen(ex.what()));
@@ -543,43 +552,123 @@ void DownloadQueue::StartTask(int id) {
         result.errorText = L"Неизвестная ошибка";
     }
 
-    {
-        std::lock_guard lock(m_mutex);
-        auto it = m_tasks.find(id);
-        if (it != m_tasks.end()) {
-            it->second.active = false;
-            --m_activeCount;
-            if (it->second.cancelRequested) {
-                it->second.snapshot.state = DownloadTaskState::Canceled;
-                it->second.snapshot.statusText = L"Отменено";
-                ++m_revision;
-            } else if (result.success) {
-                it->second.snapshot.state = DownloadTaskState::Completed;
-                it->second.snapshot.percent = 100.0;
-                it->second.snapshot.statusText = L"Готово";
-                for (const std::filesystem::path& path : result.outputFiles) {
-                    AddUniquePath(it->second.snapshot.outputFiles, path);
-                }
-                ++m_revision;
-            } else {
-                it->second.snapshot.state = DownloadTaskState::Failed;
-                it->second.snapshot.errorText = result.errorText;
-                it->second.snapshot.statusText = L"Ошибка";
-                ++m_revision;
-            }
-        }
-    }
+    FinishTask(id, stopToken, result);
     m_cv.notify_all();
+}
+
+void DownloadQueue::UpdateTaskProgress(int id, const YtDlpProgress& progress) {
+    std::lock_guard progressLock(m_mutex);
+    auto it = m_tasks.find(id);
+    if (it == m_tasks.end()) {
+        return;
+    }
+    DownloadTaskSnapshot& snapshot = it->second.snapshot;
+    if (snapshot.mediaKind == L"audio" && progress.mediaKind != L"audio") {
+        return;
+    }
+    const bool switchedTrack =
+        !snapshot.mediaKind.empty() &&
+        !progress.mediaKind.empty() &&
+        snapshot.mediaKind != progress.mediaKind;
+
+    snapshot.state = DownloadTaskState::Downloading;
+    snapshot.statusText = progress.stage;
+    const std::uint64_t diskBytes = DiskBytesForPaths(snapshot.outputFiles);
+    const std::uint64_t reportedBytes = diskBytes > 0 ? diskBytes : progress.downloadedBytes;
+    if (switchedTrack) {
+        snapshot.percent = std::clamp(progress.percent, 0.0, 100.0);
+        snapshot.downloadedBytes = reportedBytes;
+        snapshot.totalBytes = std::max(progress.totalBytes, reportedBytes);
+    } else {
+        snapshot.downloadedBytes = std::max(snapshot.downloadedBytes, reportedBytes);
+        snapshot.totalBytes = std::max({snapshot.totalBytes, progress.totalBytes, snapshot.downloadedBytes});
+        double normalizedPercent = std::clamp(progress.percent, 0.0, 100.0);
+        if (snapshot.totalBytes > 0) {
+            normalizedPercent = std::max(
+                normalizedPercent,
+                (static_cast<double>(snapshot.downloadedBytes) / static_cast<double>(snapshot.totalBytes)) * 100.0
+            );
+        }
+        snapshot.percent = std::max(snapshot.percent, std::clamp(normalizedPercent, 0.0, 100.0));
+    }
+    snapshot.speedBytesPerSecond = progress.speedBytesPerSecond;
+    snapshot.etaSeconds = progress.etaSeconds;
+    if (!progress.mediaKind.empty()) {
+        snapshot.mediaKind = progress.mediaKind;
+    }
+    snapshot.formatId = progress.formatId;
+    snapshot.extension = progress.extension;
+    snapshot.resolution = progress.resolution;
+    ++m_revision;
+}
+
+void DownloadQueue::RecordTaskOutput(int id, const std::wstring& line) {
+    std::lock_guard outputLock(m_mutex);
+    auto it = m_tasks.find(id);
+    if (it == m_tasks.end()) {
+        return;
+    }
+    AddUniquePath(it->second.snapshot.outputFiles, ExtractKnownOutputPath(line));
+    ++m_revision;
+}
+
+void DownloadQueue::FinishTask(int id, std::stop_token stopToken, const DownloadTaskResult& result) {
+    std::lock_guard finishLock(m_mutex);
+    auto it = m_tasks.find(id);
+    if (it == m_tasks.end()) {
+        return;
+    }
+
+    it->second.active = false;
+    --m_activeCount;
+    if (it->second.cancelRequested || stopToken.stop_requested()) {
+        it->second.snapshot.state = DownloadTaskState::Canceled;
+        it->second.snapshot.statusText = L"Отменено";
+        if (m_logger) {
+            m_logger->Info(L"Download task canceled: id=" + std::to_wstring(id));
+        }
+        ++m_revision;
+    } else if (result.success) {
+        it->second.snapshot.state = DownloadTaskState::Completed;
+        it->second.snapshot.percent = 100.0;
+        it->second.snapshot.statusText = L"Готово";
+        for (const std::filesystem::path& path : result.outputFiles) {
+            AddUniquePath(it->second.snapshot.outputFiles, path);
+        }
+        if (m_logger) {
+            m_logger->Info(L"Download task completed: id=" + std::to_wstring(id));
+        }
+        ++m_revision;
+    } else {
+        it->second.snapshot.state = DownloadTaskState::Failed;
+        it->second.snapshot.errorText = result.errorText;
+        it->second.snapshot.statusText = L"Ошибка";
+        if (m_logger) {
+            std::wstring error = result.errorText.substr(0, 1000);
+            m_logger->Error(
+                L"Download task failed: id=" + std::to_wstring(id) +
+                (error.empty() ? L"" : L" error=" + error)
+            );
+        }
+        ++m_revision;
+    }
+    m_finishedWorkerIds.push_back(id);
 }
 
 DownloadTaskResult DownloadQueue::DefaultExecutor(
     const DownloadTaskSnapshot& task,
+    std::stop_token stopToken,
     const DownloadTaskCallbacks& callbacks
 ) {
     ProcessRunOptions options;
     options.executable = task.request.ytDlpExePath.empty() ? std::filesystem::path(L"yt-dlp.exe") : task.request.ytDlpExePath;
     options.arguments = BuildDownloadArguments(task.request);
     options.timeoutMs = INFINITE;
+    HANDLE cancelEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!cancelEvent) {
+        throw std::runtime_error("failed to create download cancellation event");
+    }
+    options.cancelEvent = cancelEvent;
     options.onStdoutLine = [callbacks](const std::wstring& line) {
         if (callbacks.onOutputLine) {
             callbacks.onOutputLine(line);
@@ -591,8 +680,18 @@ DownloadTaskResult DownloadQueue::DefaultExecutor(
     };
     options.onStderrLine = callbacks.onOutputLine;
 
-    const ProcessRunResult result = ProcessRunner::Run(options);
-    if (callbacks.isCanceled && callbacks.isCanceled()) {
+    ProcessRunResult result;
+    try {
+        std::stop_callback stopCallback(stopToken, [cancelEvent]() {
+            SetEvent(cancelEvent);
+        });
+        result = ProcessRunner::Run(options);
+    } catch (...) {
+        CloseHandle(cancelEvent);
+        throw;
+    }
+    CloseHandle(cancelEvent);
+    if (result.canceled || stopToken.stop_requested()) {
         return {false, L"Отменено", {}};
     }
     if (result.exitCode != 0) {

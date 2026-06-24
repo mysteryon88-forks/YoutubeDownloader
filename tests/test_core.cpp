@@ -21,7 +21,6 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <optional>
 #include <ranges>
 #include <string>
 #include <system_error>
@@ -818,24 +817,80 @@ void TerminateProcessIfStillRunning(DWORD processId) {
     CloseHandle(process);
 }
 
+std::filesystem::path CurrentTestExecutablePath() {
+    std::wstring buffer(MAX_PATH, L'\0');
+    DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    while (length == buffer.size()) {
+        buffer.resize(buffer.size() * 2, L'\0');
+        length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    }
+    Require(length > 0, "failed to resolve current test executable path");
+    buffer.resize(length);
+    return buffer;
+}
+
+std::wstring QuoteCommandArgument(const std::wstring& arg) {
+    std::wstring quoted = L"\"";
+    for (wchar_t ch : arg) {
+        if (ch == L'"') {
+            quoted += L"\\\"";
+        } else {
+            quoted.push_back(ch);
+        }
+    }
+    quoted.push_back(L'"');
+    return quoted;
+}
+
+int RunProcessTreeParentFixture() {
+    STARTUPINFOW startup = {};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESHOWWINDOW;
+    startup.wShowWindow = SW_HIDE;
+
+    PROCESS_INFORMATION process = {};
+    std::wstring commandLine =
+        QuoteCommandArgument(CurrentTestExecutablePath().wstring()) + L" --process-tree-child-fixture";
+    if (!CreateProcessW(
+            nullptr,
+            commandLine.data(),
+            nullptr,
+            nullptr,
+            FALSE,
+            CREATE_NO_WINDOW,
+            nullptr,
+            nullptr,
+            &startup,
+            &process
+        )) {
+        return 2;
+    }
+
+    std::cout << process.dwProcessId << "\n";
+    std::cout.flush();
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    Sleep(60000);
+    return 0;
+}
+
+int RunProcessTreeChildFixture() {
+    Sleep(60000);
+    return 0;
+}
+
 void TestProcessRunnerCancelKillsChildProcessTree() {
     HANDLE cancelEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     Require(cancelEvent != nullptr, "failed to create process cancel event");
 
-    std::optional<DWORD> childPid;
+    DWORD childPid = 0;
     ProcessRunOptions options;
-    options.executable = L"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
-    options.arguments = {
-        L"-NoProfile",
-        L"-Command",
-        L"$child = Start-Process powershell -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 60' -PassThru; "
-        L"Write-Output $child.Id; "
-        L"Start-Sleep -Seconds 60"
-    };
+    options.executable = CurrentTestExecutablePath();
+    options.arguments = {L"--process-tree-parent-fixture"};
     options.timeoutMs = 10000;
     options.cancelEvent = cancelEvent;
     options.onStdoutLine = [&](const std::wstring& line) {
-        if (childPid || line.empty()) {
+        if (childPid != 0 || line.empty()) {
             return;
         }
         try {
@@ -849,10 +904,10 @@ void TestProcessRunnerCancelKillsChildProcessTree() {
     CloseHandle(cancelEvent);
 
     Require(result.canceled, "parent process should be canceled");
-    Require(childPid.has_value(), "child process id was not captured");
-    const bool childExited = WaitForProcessExit(*childPid, std::chrono::milliseconds(5000));
+    Require(childPid != 0, "child process id was not captured");
+    const bool childExited = WaitForProcessExit(childPid, std::chrono::milliseconds(5000));
     if (!childExited) {
-        TerminateProcessIfStillRunning(*childPid);
+        TerminateProcessIfStillRunning(childPid);
     }
     Require(childExited, "canceling a process run should kill child processes");
 }
@@ -1742,7 +1797,14 @@ void TestDownloadQueueDeletedTaskIsNotExported() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc >= 2 && std::string(argv[1]) == "--process-tree-parent-fixture") {
+        return RunProcessTreeParentFixture();
+    }
+    if (argc >= 2 && std::string(argv[1]) == "--process-tree-child-fixture") {
+        return RunProcessTreeChildFixture();
+    }
+
     TestAppPaths();
     TestDownloadQueueStoreRoundTripSnapshots();
     TestDownloadQueueStoreSkipsInvalidEntries();

@@ -98,6 +98,9 @@ private:
     struct TaskRecord {
         DownloadTaskSnapshot snapshot;
         std::chrono::steady_clock::time_point startedAt{};
+        std::chrono::steady_clock::time_point postProcessingStartedAt{};
+        double lastPostProcessingLoggedPercent = -1.0;
+        std::wstring lastPostProcessingLoggedStatus;
         bool cancelRequested = false;
         bool active = false;
         bool postProcessingOnly = false;

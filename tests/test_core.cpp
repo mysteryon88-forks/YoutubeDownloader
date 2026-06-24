@@ -1939,6 +1939,38 @@ void TestDownloadQueueLogsTaskLifecycle() {
     Require(text.find("completed") != std::string::npos, "queue log should record task completion");
 }
 
+void TestDownloadQueueLogsPostProcessingProgress() {
+    const fs::path root = MakeTempRoot(L"YoutubeDownloaderTests_PostProcessingLogger");
+    const AppPaths paths(root);
+    Logger logger(paths);
+    DownloadQueue queue(1, &logger);
+    queue.SetExecutor([](
+        const DownloadTaskSnapshot& task,
+        std::stop_token,
+        const DownloadTaskCallbacks& callbacks
+    ) {
+        UNREFERENCED_PARAMETER(task);
+        callbacks.onPostProcessing(50.0, L"Recognizing speech");
+        return DownloadTaskResult{true, L"", {}};
+    });
+
+    YtDlpDownloadRequest request;
+    request.url = L"https://example.invalid/logged-post-processing";
+    queue.Enqueue(request, L"Logged post-processing");
+    queue.WaitForIdle();
+
+    std::ifstream log(paths.logPath(), std::ios::binary);
+    const std::string text{
+        std::istreambuf_iterator<char>(log),
+        std::istreambuf_iterator<char>()
+    };
+    Require(text.find("Post-processing progress") != std::string::npos, "queue log should record post-processing progress");
+    Require(text.find("status=\"Recognizing speech\"") != std::string::npos, "queue log should include post-processing status");
+    Require(text.find("progress=50.0%") != std::string::npos, "queue log should include post-processing percent");
+    Require(text.find("elapsed=") != std::string::npos, "queue log should include post-processing elapsed time");
+    Require(text.find("eta=") != std::string::npos, "queue log should include post-processing eta");
+}
+
 void TestDownloadQueueShutdownWaitsForActiveWorker() {
     std::atomic<bool> started = false;
     std::atomic<bool> finished = false;
@@ -2804,6 +2836,7 @@ int main(int argc, char** argv) {
     TestDownloadQueueProgressResetsForNextDownloadTrack();
     TestDownloadQueueStartsPostProcessingForCompletedTask();
     TestDownloadQueueLogsTaskLifecycle();
+    TestDownloadQueueLogsPostProcessingProgress();
     TestDownloadQueueShutdownWaitsForActiveWorker();
     TestDownloadQueueUpdatesParallelismAtRuntime();
     TestDownloadQueueRejectsDuplicateVisibleUrl();

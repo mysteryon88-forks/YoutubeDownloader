@@ -7,8 +7,11 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstring>
+#include <iomanip>
 #include <ranges>
+#include <sstream>
 #include <string_view>
 #include <system_error>
 
@@ -25,6 +28,55 @@ std::uint64_t ElapsedSecondsSince(std::chrono::steady_clock::time_point startedA
         return 1;
     }
     return static_cast<std::uint64_t>((milliseconds + 999) / 1000);
+}
+
+std::wstring FormatDurationForLog(std::uint64_t seconds) {
+    if (seconds == 0) {
+        return L"0 с";
+    }
+    return FormatDuration(seconds);
+}
+
+std::wstring FormatPercentForLog(double percent) {
+    std::wostringstream out;
+    out << std::fixed << std::setprecision(1) << std::clamp(percent, 0.0, 100.0) << L"%";
+    return out.str();
+}
+
+std::wstring FormatEtaForLog(double percent, std::uint64_t elapsedSeconds) {
+    if (percent <= 0.0 || elapsedSeconds == 0) {
+        return L"pending";
+    }
+    if (percent >= 100.0) {
+        return L"0 с";
+    }
+
+    const double remainingSeconds = (static_cast<double>(elapsedSeconds) * (100.0 - percent)) / percent;
+    return FormatDurationForLog(static_cast<std::uint64_t>(std::ceil(std::max(0.0, remainingSeconds))));
+}
+
+std::wstring SanitizeLogField(std::wstring value) {
+    for (wchar_t& ch : value) {
+        if (ch == L'\r' || ch == L'\n') {
+            ch = L' ';
+        } else if (ch == L'"') {
+            ch = L'\'';
+        }
+    }
+    return value;
+}
+
+std::wstring BuildPostProcessingProgressLog(
+    int id,
+    double percent,
+    const std::wstring& status,
+    std::uint64_t elapsedSeconds
+) {
+    return L"Post-processing progress: id=" + std::to_wstring(id) +
+        L" status=\"" + SanitizeLogField(status) + L"\"" +
+        L" progress=" + FormatPercentForLog(percent) +
+        L" elapsed=" + FormatDurationForLog(elapsedSeconds) +
+        L" eta=" + FormatEtaForLog(percent, elapsedSeconds);
 }
 
 void AddUniquePath(std::vector<std::filesystem::path>& paths, const std::filesystem::path& path) {
@@ -343,6 +395,9 @@ bool DownloadQueue::Retry(int id) {
     task.cancelRequested = false;
     task.postProcessingOnly = false;
     task.startedAt = {};
+    task.postProcessingStartedAt = {};
+    task.lastPostProcessingLoggedPercent = -1.0;
+    task.lastPostProcessingLoggedStatus.clear();
     task.snapshot.state = DownloadTaskState::Queued;
     task.snapshot.percent = 0.0;
     task.snapshot.errorText.clear();
@@ -382,6 +437,9 @@ bool DownloadQueue::StartPostProcessing(int id, DownloadTaskExecutor executor, s
         task.active = true;
         task.cancelRequested = false;
         task.postProcessingOnly = true;
+        task.postProcessingStartedAt = std::chrono::steady_clock::now();
+        task.lastPostProcessingLoggedPercent = -1.0;
+        task.lastPostProcessingLoggedStatus.clear();
         task.snapshot.state = DownloadTaskState::PostProcessing;
         task.snapshot.percent = 0.0;
         task.snapshot.errorText.clear();
@@ -628,6 +686,9 @@ void DownloadQueue::SchedulerLoop() {
             nextTask->second.active = true;
             nextTask->second.postProcessingOnly = false;
             nextTask->second.startedAt = std::chrono::steady_clock::now();
+            nextTask->second.postProcessingStartedAt = {};
+            nextTask->second.lastPostProcessingLoggedPercent = -1.0;
+            nextTask->second.lastPostProcessingLoggedStatus.clear();
             nextTask->second.snapshot.state = DownloadTaskState::Preparing;
             nextTask->second.snapshot.statusText = L"Подготовка";
             ++m_revision;
@@ -668,17 +729,40 @@ void DownloadQueue::RunTask(int id, DownloadTaskExecutor executor, std::stop_tok
         UpdateTaskProgress(id, progress);
     };
     callbacks.onPostProcessing = [this, id](double percent, const std::wstring& status) {
-        std::lock_guard lock(m_mutex);
-        auto it = m_tasks.find(id);
-        if (it == m_tasks.end()) {
-            return;
+        std::wstring logLine;
+        {
+            std::lock_guard lock(m_mutex);
+            auto it = m_tasks.find(id);
+            if (it == m_tasks.end()) {
+                return;
+            }
+            TaskRecord& task = it->second;
+            const double clampedPercent = std::clamp(percent, 0.0, 100.0);
+            if (task.postProcessingStartedAt == std::chrono::steady_clock::time_point{}) {
+                task.postProcessingStartedAt = std::chrono::steady_clock::now();
+            }
+
+            const bool firstLog = task.lastPostProcessingLoggedPercent < 0.0;
+            const bool statusChanged = task.lastPostProcessingLoggedStatus != status;
+            const bool progressAdvanced = clampedPercent >= task.lastPostProcessingLoggedPercent + 10.0;
+            const bool finalProgress = clampedPercent >= 99.0 && task.lastPostProcessingLoggedPercent < 99.0;
+            if (firstLog || statusChanged || progressAdvanced || finalProgress) {
+                const std::uint64_t elapsedSeconds = ElapsedSecondsSince(task.postProcessingStartedAt);
+                logLine = BuildPostProcessingProgressLog(id, clampedPercent, status, elapsedSeconds);
+                task.lastPostProcessingLoggedPercent = clampedPercent;
+                task.lastPostProcessingLoggedStatus = status;
+            }
+
+            task.snapshot.state = DownloadTaskState::PostProcessing;
+            task.snapshot.percent = clampedPercent;
+            task.snapshot.statusText = status;
+            task.snapshot.speedBytesPerSecond = 0;
+            task.snapshot.etaSeconds = 0;
+            ++m_revision;
         }
-        it->second.snapshot.state = DownloadTaskState::PostProcessing;
-        it->second.snapshot.percent = std::clamp(percent, 0.0, 100.0);
-        it->second.snapshot.statusText = status;
-        it->second.snapshot.speedBytesPerSecond = 0;
-        it->second.snapshot.etaSeconds = 0;
-        ++m_revision;
+        if (m_logger && !logLine.empty()) {
+            m_logger->Info(logLine);
+        }
     };
     callbacks.onOutputLine = [this, id](const std::wstring& line) {
         RecordTaskOutput(id, line);
@@ -841,6 +925,9 @@ void DownloadQueue::FinishTask(int id, std::stop_token stopToken, const Download
         ++m_revision;
     }
     it->second.startedAt = {};
+    it->second.postProcessingStartedAt = {};
+    it->second.lastPostProcessingLoggedPercent = -1.0;
+    it->second.lastPostProcessingLoggedStatus.clear();
     m_finishedWorkerIds.push_back(id);
 }
 

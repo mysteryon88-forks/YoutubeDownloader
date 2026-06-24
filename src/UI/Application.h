@@ -67,6 +67,7 @@ private:
     void DrawPreviewContent(HDC dc, const RECT& previewRect);
     void DrawQueueContent(HDC dc, const RECT& queueRect);
     bool HandleQueueClick(POINT point);
+    bool HandleQueueContextMenu(POINT point);
     bool UpdateQueueHover(POINT point);
     void ClearQueueHover();
     bool ScrollQueue(int wheelDelta, POINT point);
@@ -98,6 +99,7 @@ private:
     HWND m_downloadButton = nullptr;
     HWND m_clearButton = nullptr;
     HWND m_clearFinishedButton = nullptr;
+    HWND m_logsButton = nullptr;
     HWND m_settingsButton = nullptr;
     HWND m_statusLabel = nullptr;
     HWND m_queueLabel = nullptr;

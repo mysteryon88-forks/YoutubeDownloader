@@ -56,3 +56,21 @@ void Logger::Append(const std::wstring& level, const std::wstring& message) {
     out << WideToUtf8(L"[" + TimestampUtc() + L"] [" + level + L"] " + message + L"\n");
 }
 
+std::wstring Logger::ReadAll() const {
+    std::lock_guard lock(m_mutex);
+
+    std::ifstream in(m_logPath, std::ios::binary);
+    if (!in) {
+        return {};
+    }
+
+    std::string text{
+        std::istreambuf_iterator<char>(in),
+        std::istreambuf_iterator<char>()
+    };
+    if (text.empty()) {
+        return {};
+    }
+    return Utf8ToWide(text);
+}
+

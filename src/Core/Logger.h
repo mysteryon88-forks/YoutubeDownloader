@@ -14,9 +14,9 @@ public:
     void Info(const std::wstring& message);
     void Error(const std::wstring& message);
     void Append(const std::wstring& level, const std::wstring& message);
+    std::wstring ReadAll() const;
 
 private:
     std::filesystem::path m_logPath;
-    std::mutex m_mutex;
+    mutable std::mutex m_mutex;
 };
-

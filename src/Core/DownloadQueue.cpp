@@ -480,7 +480,16 @@ void DownloadQueue::ImportSnapshots(const std::vector<DownloadTaskSnapshot>& tas
 }
 
 std::vector<DownloadTaskSnapshot> DownloadQueue::ExportSnapshots() const {
-    return Snapshot();
+    std::lock_guard lock(m_mutex);
+    std::vector<DownloadTaskSnapshot> result;
+    result.reserve(m_tasks.size());
+    for (const auto& [id, task] : m_tasks) {
+        UNREFERENCED_PARAMETER(id);
+        if (task.snapshot.state != DownloadTaskState::Completed) {
+            result.push_back(task.snapshot);
+        }
+    }
+    return result;
 }
 
 std::vector<DownloadTaskSnapshot> DownloadQueue::ExportSnapshotsForShutdown() const {
@@ -489,7 +498,9 @@ std::vector<DownloadTaskSnapshot> DownloadQueue::ExportSnapshotsForShutdown() co
     result.reserve(m_tasks.size());
     for (const auto& [id, task] : m_tasks) {
         UNREFERENCED_PARAMETER(id);
-        result.push_back(SnapshotForShutdown(task.snapshot));
+        if (task.snapshot.state != DownloadTaskState::Completed) {
+            result.push_back(SnapshotForShutdown(task.snapshot));
+        }
     }
     return result;
 }

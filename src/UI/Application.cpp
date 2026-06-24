@@ -32,6 +32,7 @@ namespace {
 
 constexpr const wchar_t* kWindowClassName = L"YoutubeDownloaderWin32Class";
 constexpr const wchar_t* kButtonClassName = L"YoutubeDownloaderButtonClass";
+constexpr const wchar_t* kQueueErrorMenuClassName = L"YoutubeDownloaderQueueErrorMenu";
 constexpr int kInitialWindowWidth = 1000;
 constexpr int kInitialWindowHeight = 640;
 constexpr COLORREF kBackgroundColor = RGB(20, 20, 22);
@@ -60,7 +61,8 @@ enum ControlId {
     IdDownloadButton = 1004,
     IdClearButton = 1005,
     IdSettingsButton = 1006,
-    IdClearFinishedButton = 1007
+    IdClearFinishedButton = 1007,
+    IdLogsButton = 1008
 };
 
 struct ButtonState {
@@ -70,6 +72,12 @@ struct ButtonState {
     bool hot = false;
     bool pressed = false;
     std::wstring text;
+};
+
+struct QueueErrorMenuState {
+    HWND owner = nullptr;
+    std::wstring errorText;
+    bool hot = false;
 };
 
 class UniqueHandle {
@@ -462,6 +470,92 @@ void AddTooltip(HWND tooltip, HWND parent, HWND tool, const wchar_t* text) {
     SendMessageW(tooltip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&info));
 }
 
+LRESULT CALLBACK QueueErrorMenuProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    QueueErrorMenuState* state = reinterpret_cast<QueueErrorMenuState*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        const CREATESTRUCTW* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        state = static_cast<QueueErrorMenuState*>(create->lpCreateParams);
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+        return TRUE;
+    }
+
+    switch (message) {
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_MOUSEMOVE:
+        if (state && !state->hot) {
+            state->hot = true;
+            TRACKMOUSEEVENT track = {};
+            track.cbSize = sizeof(track);
+            track.dwFlags = TME_LEAVE;
+            track.hwndTrack = window;
+            TrackMouseEvent(&track);
+            InvalidateRect(window, nullptr, FALSE);
+        }
+        return 0;
+
+    case WM_MOUSELEAVE:
+        if (state && state->hot) {
+            state->hot = false;
+            InvalidateRect(window, nullptr, FALSE);
+        }
+        return 0;
+
+    case WM_PAINT:
+        PaintBuffered(window, [state](HDC dc, const RECT& client) {
+            const std::vector<UiRenderer::PopupMenuItem> items = {
+                {1, L"Скопировать ошибку", false}
+            };
+            UiRenderer::DrawPopupMenu(dc, client, items, state && state->hot ? 1 : 0);
+        });
+        return 0;
+
+    case WM_LBUTTONUP:
+        if (state && !state->errorText.empty()) {
+            CopyTextToClipboard(state->owner ? state->owner : window, state->errorText);
+        }
+        DestroyWindow(window);
+        return 0;
+
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE) {
+            DestroyWindow(window);
+            return 0;
+        }
+        if (wParam == VK_RETURN || wParam == VK_SPACE) {
+            if (state && !state->errorText.empty()) {
+                CopyTextToClipboard(state->owner ? state->owner : window, state->errorText);
+            }
+            DestroyWindow(window);
+            return 0;
+        }
+        break;
+
+    case WM_KILLFOCUS:
+        DestroyWindow(window);
+        return 0;
+
+    case WM_NCDESTROY:
+        delete state;
+        SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+        return 0;
+    }
+
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+void RegisterQueueErrorMenuClass(HINSTANCE instance) {
+    WNDCLASSEXW menuClass = {};
+    menuClass.cbSize = sizeof(menuClass);
+    menuClass.lpfnWndProc = QueueErrorMenuProc;
+    menuClass.hInstance = instance;
+    menuClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    menuClass.hbrBackground = nullptr;
+    menuClass.lpszClassName = kQueueErrorMenuClassName;
+    RegisterClassExW(&menuClass);
+}
+
 } // namespace
 
 Application::Application() = default;
@@ -491,6 +585,7 @@ bool Application::Initialize(HINSTANCE instance, int showCommand) {
         MessageBoxW(nullptr, L"Не удалось зарегистрировать класс кнопок.", L"YouTube Downloader", MB_OK | MB_ICONERROR);
         return false;
     }
+    RegisterQueueErrorMenuClass(m_instance);
 
     WNDCLASSEXW windowClass = {};
     windowClass.cbSize = sizeof(windowClass);
@@ -772,6 +867,27 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         }
         break;
 
+    case WM_RBUTTONUP:
+        {
+            POINT point = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            if (HandleQueueContextMenu(point)) {
+                return 0;
+            }
+        }
+        break;
+
+    case WM_CONTEXTMENU:
+        {
+            POINT point = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            if (point.x != -1 || point.y != -1) {
+                ScreenToClient(m_window, &point);
+                if (HandleQueueContextMenu(point)) {
+                    return 0;
+                }
+            }
+        }
+        break;
+
     case WM_MOUSEWHEEL:
         {
             POINT point = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
@@ -888,6 +1004,11 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                 SetTransientStatus(L"Завершённые задачи очищены: удалено " + std::to_wstring(removed) + L" задач");
                 RefreshQueueText();
             }
+            return 0;
+        }
+        if (LOWORD(wParam) == IdLogsButton) {
+            const std::wstring logText = m_logger ? m_logger->ReadAll() : std::wstring{};
+            ShowLogsDialog(m_window, m_instance, logText);
             return 0;
         }
         if (LOWORD(wParam) == IdSettingsButton) {
@@ -1127,6 +1248,7 @@ void Application::CreateControls() {
 
     m_downloadButton = CreateButton(L"Скачать", IdDownloadButton, true, false);
     m_clearButton = CreateButton(L"Очистить очередь", IdClearButton, false, false);
+    m_logsButton = CreateButton(L"Логи", IdLogsButton, false, false);
     m_clearFinishedButton = CreateButton(L"X", IdClearFinishedButton, false, false);
     m_settingsButton = CreateButton(L"Настройки", IdSettingsButton, false, false);
     m_statusLabel = CreateChild(m_window, L"STATIC", L"Подготовка интерфейса", SS_LEFT, 0, 0);
@@ -1141,6 +1263,7 @@ void Application::CreateControls() {
     AddTooltip(m_tooltip, m_window, m_chooseFolderButton, L"Выберите папку для сохранения загрузок.");
     AddTooltip(m_tooltip, m_window, m_downloadButton, L"Добавляет ссылку в очередь загрузок.");
     AddTooltip(m_tooltip, m_window, m_clearButton, L"Удаляет из очереди задачи, которые ещё не начали загружаться. Активные загрузки не останавливаются.");
+    AddTooltip(m_tooltip, m_window, m_logsButton, L"Открывает текущий файл логов.");
     AddTooltip(m_tooltip, m_window, m_clearFinishedButton, L"Очищает из списка завершённые и ошибочные задачи. Файлы на диске не удаляются.");
     AddTooltip(m_tooltip, m_window, m_settingsButton, L"Открывает настройки качества, контейнера, FFmpeg и поведения приложения.");
 
@@ -1206,6 +1329,8 @@ void Application::LayoutControls(int width, int height) {
     MoveWindow(m_statusLabel, margin + 316, 246, width - (margin * 2) - 456, 22, TRUE);
 
     MoveWindow(m_queueLabel, margin, 298, 220, 22, TRUE);
+    const int clearFinishedLeft = width - margin - 34;
+    MoveWindow(m_logsButton, buttonX, 292, std::max(76, clearFinishedLeft - 8 - buttonX), 30, TRUE);
     MoveWindow(m_clearFinishedButton, width - margin - 34, 292, 34, 30, TRUE);
     MoveWindow(m_queuePlaceholder, margin + 24, 360, width - (margin * 2) - 48, 28, TRUE);
     InvalidateRect(m_window, nullptr, TRUE);
@@ -1468,6 +1593,79 @@ bool Application::HandleQueueClick(POINT point) {
     return false;
 }
 
+bool Application::HandleQueueContextMenu(POINT point) {
+    if (!m_downloadQueue) {
+        return false;
+    }
+
+    RECT client = {};
+    GetClientRect(m_window, &client);
+    const RECT queueRect = QueuePanelRectForClient(client);
+    if (!PtInRect(&queueRect, point)) {
+        return false;
+    }
+
+    const std::vector<DownloadTaskSnapshot> tasks = m_downloadQueue->Snapshot();
+    const int maxOffset = QueueMaxScrollOffset(queueRect, tasks.size());
+    m_queueScrollOffset = std::clamp(m_queueScrollOffset, 0, maxOffset);
+    const int maxY = queueRect.bottom - 16;
+    const int visibleRows = QueueVisibleRowCount(queueRect);
+    for (int visibleIndex = 0; visibleIndex < visibleRows; ++visibleIndex) {
+        const int taskIndex = m_queueScrollOffset + visibleIndex;
+        if (taskIndex >= static_cast<int>(tasks.size())) {
+            break;
+        }
+        const RECT row = QueueRowRectAt(queueRect, visibleIndex);
+        if (row.bottom > maxY) {
+            break;
+        }
+        if (!PtInRect(&row, point)) {
+            continue;
+        }
+
+        const DownloadTaskSnapshot& task = tasks[static_cast<size_t>(taskIndex)];
+        if (task.errorText.empty()) {
+            return false;
+        }
+
+        auto* menuState = new QueueErrorMenuState{};
+        menuState->owner = m_window;
+        menuState->errorText = task.errorText;
+
+        POINT screenPoint = point;
+        ClientToScreen(m_window, &screenPoint);
+        constexpr int menuWidth = 204;
+        constexpr int menuHeight = 36;
+        RECT workArea = {};
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+        const int x = std::min(static_cast<int>(screenPoint.x), static_cast<int>(workArea.right) - menuWidth);
+        const int y = std::min(static_cast<int>(screenPoint.y), static_cast<int>(workArea.bottom) - menuHeight);
+        HWND menu = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            kQueueErrorMenuClassName,
+            L"",
+            WS_POPUP,
+            std::max(static_cast<int>(workArea.left), x),
+            std::max(static_cast<int>(workArea.top), y),
+            menuWidth,
+            menuHeight,
+            m_window,
+            nullptr,
+            m_instance,
+            menuState
+        );
+        if (!menu) {
+            delete menuState;
+            return false;
+        }
+        ShowWindow(menu, SW_SHOW);
+        SetFocus(menu);
+        return true;
+    }
+
+    return false;
+}
+
 bool Application::UpdateQueueHover(POINT point) {
     int hotTaskId = 0;
     int hotAction = 0;
@@ -1583,7 +1781,7 @@ bool Application::ScrollQueue(int wheelDelta, POINT point) {
 }
 
 void Application::SetControlFonts() {
-    const std::array<HWND, 12> controls = {
+    const std::array<HWND, 13> controls = {
         m_urlEdit,
         m_pasteButton,
         m_previewTitle,
@@ -1591,6 +1789,7 @@ void Application::SetControlFonts() {
         m_chooseFolderButton,
         m_downloadButton,
         m_clearButton,
+        m_logsButton,
         m_clearFinishedButton,
         m_settingsButton,
         m_statusLabel,

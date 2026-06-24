@@ -367,6 +367,21 @@ void TestLoggerTruncatesAtStartupAndAppendsWithinRun() {
     Require(text.find("failure") != std::string::npos, "error log entry missing");
 }
 
+void TestLoggerReadsCurrentLogText() {
+    const fs::path root = MakeTempRoot(L"YoutubeDownloaderTests_LoggerRead");
+    const AppPaths paths(root);
+    Logger logger(paths);
+
+    logger.Info(L"first line");
+    logger.Error(L"second line");
+
+    const std::wstring text = logger.ReadAll();
+    Require(text.find(L"first line") != std::wstring::npos, "log reader should include info entries");
+    Require(text.find(L"second line") != std::wstring::npos, "log reader should include error entries");
+    Require(text.find(L"[INFO]") != std::wstring::npos, "log reader should preserve levels");
+    Require(text.find(L"[ERROR]") != std::wstring::npos, "log reader should preserve error levels");
+}
+
 void TestCommitDownloadedFilePreservesTargetUntilValidated() {
     const fs::path root = MakeTempRoot(L"YoutubeDownloaderTests_FileCommit");
     const fs::path target = root / L"tool.exe";
@@ -1782,6 +1797,27 @@ void TestDownloadQueueExportForShutdownStopsActiveTasks() {
     Require(shutdown.front().statusText == L"Остановлено", "active task shutdown status mismatch");
 }
 
+void TestDownloadQueueExportSkipsCompletedTasks() {
+    DownloadQueue queue(1);
+    queue.SetExecutor([](
+        const DownloadTaskSnapshot&,
+        std::stop_token,
+        const DownloadTaskCallbacks&
+    ) {
+        return DownloadTaskResult{true, L"", {}};
+    });
+
+    YtDlpDownloadRequest request;
+    request.url = L"https://example.invalid/completed-export";
+    const int id = queue.Enqueue(request, L"Completed Export");
+    queue.WaitForIdle();
+
+    Require(queue.GetTask(id).state == DownloadTaskState::Completed, "completed export fixture should complete");
+    Require(queue.Snapshot().size() == 1, "completed task should remain visible in the current UI snapshot");
+    Require(queue.ExportSnapshots().empty(), "completed task should not be persisted during normal export");
+    Require(queue.ExportSnapshotsForShutdown().empty(), "completed task should not be persisted during shutdown export");
+}
+
 void TestDownloadQueueDeletedTaskIsNotExported() {
     DownloadQueue queue(1);
     queue.SetExecutor([](
@@ -1826,6 +1862,7 @@ int main(int argc, char** argv) {
     TestConfigParallelDownloadBounds();
     TestConfigUtf8RoundTrip();
     TestLoggerTruncatesAtStartupAndAppendsWithinRun();
+    TestLoggerReadsCurrentLogText();
     TestCommitDownloadedFilePreservesTargetUntilValidated();
     TestWaitForDelayCompletesOrStopsPromptly();
     TestProgressPresentation();
@@ -1863,6 +1900,7 @@ int main(int argc, char** argv) {
     TestDownloadQueueClearFinishedDeletesInvalidPartFilesOnly();
     TestDownloadQueueImportsRestoredTasksWithoutStartingThem();
     TestDownloadQueueExportForShutdownStopsActiveTasks();
+    TestDownloadQueueExportSkipsCompletedTasks();
     TestDownloadQueueDeletedTaskIsNotExported();
     return 0;
 }

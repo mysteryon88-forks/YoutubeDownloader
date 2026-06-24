@@ -64,7 +64,6 @@ public:
     explicit YtDlpClient(YtDlpClientOptions options);
 
     VideoPreview FetchPreview(const std::wstring& url, HANDLE cancelEvent = nullptr) const;
-    VideoPreview ExpandPlaylist(const std::wstring& url, HANDLE cancelEvent = nullptr) const;
     std::filesystem::path CacheThumbnail(const VideoPreview& preview, HANDLE cancelEvent = nullptr) const;
 
 private:

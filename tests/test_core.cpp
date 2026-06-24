@@ -851,6 +851,17 @@ std::filesystem::path CurrentTestExecutablePath() {
     return buffer;
 }
 
+void TestYtDlpExecutableVersionValidation() {
+    Require(
+        ValidateYtDlpExecutableVersion(CurrentTestExecutablePath(), L"2026.06.09"),
+        "yt-dlp executable validation should accept expected version output"
+    );
+    Require(
+        !ValidateYtDlpExecutableVersion(CurrentTestExecutablePath(), L"2026.06.10"),
+        "yt-dlp executable validation should reject mismatched version output"
+    );
+}
+
 std::wstring QuoteCommandArgument(const std::wstring& arg) {
     std::wstring quoted = L"\"";
     for (wchar_t ch : arg) {
@@ -1192,6 +1203,32 @@ void TestDownloadQueueRejectsDuplicateVisibleUrl() {
     queue.WaitForIdle();
 }
 
+void TestDownloadQueueAllowsDuplicateUrlAfterCompletion() {
+    DownloadQueue queue(1);
+    queue.SetExecutor([](
+        const DownloadTaskSnapshot& task,
+        std::stop_token,
+        const DownloadTaskCallbacks& callbacks
+    ) {
+        UNREFERENCED_PARAMETER(task);
+        UNREFERENCED_PARAMETER(callbacks);
+        return DownloadTaskResult{true, L"", {}};
+    });
+
+    YtDlpDownloadRequest request;
+    request.url = L"https://example.invalid/repeat-completed";
+    request.outputDirectory = fs::temp_directory_path();
+
+    const int first = queue.Enqueue(request, L"First");
+    queue.WaitForIdle();
+    Require(queue.GetTask(first).state == DownloadTaskState::Completed, "first duplicate-url task should complete");
+
+    const int second = queue.Enqueue(request, L"Second");
+    Require(second != first, "completed duplicate URL should enqueue a new task");
+    Require(queue.Snapshot().size() == 2, "completed duplicate URL should keep both visible task rows");
+    queue.WaitForIdle();
+}
+
 void TestDownloadQueueEnrichesDuplicateVisibleUrl() {
     DownloadQueue queue(1);
     queue.SetExecutor([](
@@ -1218,6 +1255,31 @@ void TestDownloadQueueEnrichesDuplicateVisibleUrl() {
     Require(task.title == L"Resolved Title", "duplicate enqueue should enrich placeholder title");
     Require(task.thumbnailPath == thumbnail, "duplicate enqueue should enrich missing thumbnail");
     queue.WaitForIdle();
+}
+
+void TestDownloadQueueIgnoresOutputLinesWithoutPathsForRevision() {
+    DownloadQueue queue(1);
+    std::atomic<std::uint64_t> beforeLine = 0;
+    std::atomic<std::uint64_t> afterLine = 0;
+    queue.SetExecutor([&](
+        const DownloadTaskSnapshot& task,
+        std::stop_token,
+        const DownloadTaskCallbacks& callbacks
+    ) {
+        UNREFERENCED_PARAMETER(task);
+        beforeLine = queue.Revision();
+        callbacks.onOutputLine(L"[download] plain status line without output path");
+        afterLine = queue.Revision();
+        return DownloadTaskResult{true, L"", {}};
+    });
+
+    YtDlpDownloadRequest request;
+    request.url = L"https://example.invalid/revision-noise";
+    request.outputDirectory = fs::temp_directory_path();
+
+    queue.Enqueue(request, L"Revision Noise");
+    queue.WaitForIdle();
+    Require(beforeLine.load() == afterLine.load(), "non-path output lines should not change queue revision");
 }
 
 void TestDownloadQueueEnrichesExistingTaskAfterPreviewCompletes() {
@@ -1841,6 +1903,10 @@ void TestDownloadQueueDeletedTaskIsNotExported() {
 } // namespace
 
 int main(int argc, char** argv) {
+    if (argc >= 2 && std::string(argv[1]) == "--version") {
+        std::cout << "2026.06.09\n";
+        return 0;
+    }
     if (argc >= 2 && std::string(argv[1]) == "--process-tree-parent-fixture") {
         return RunProcessTreeParentFixture();
     }
@@ -1871,6 +1937,7 @@ int main(int argc, char** argv) {
     TestYtDlpProgressParsing();
     TestGitHubReleaseParsing();
     TestYtDlpUpdateDecision();
+    TestYtDlpExecutableVersionValidation();
     TestAppUpdateDecision();
     TestAppUpdatePromptMessage();
     TestFfmpegResolutionPrecedence();
@@ -1884,7 +1951,9 @@ int main(int argc, char** argv) {
     TestDownloadQueueShutdownWaitsForActiveWorker();
     TestDownloadQueueUpdatesParallelismAtRuntime();
     TestDownloadQueueRejectsDuplicateVisibleUrl();
+    TestDownloadQueueAllowsDuplicateUrlAfterCompletion();
     TestDownloadQueueEnrichesDuplicateVisibleUrl();
+    TestDownloadQueueIgnoresOutputLinesWithoutPathsForRevision();
     TestDownloadQueueEnrichesExistingTaskAfterPreviewCompletes();
     TestDownloadQueueCancelAndDeleteTask();
     TestDownloadQueueCloseCompletedTaskKeepsOutputFile();

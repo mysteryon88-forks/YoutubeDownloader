@@ -9,6 +9,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cwctype>
 #include <fstream>
 #include <iterator>
 #include <sstream>
@@ -451,6 +452,37 @@ bool ShouldInstallYtDlpUpdate(const ToolInstallStatus& current, const ReleaseAss
     return CompareVersions(current.version, latest.version) < 0;
 }
 
+bool ValidateYtDlpExecutableVersion(const std::filesystem::path& executable, const std::wstring& expectedVersion) {
+    if (!IsExecutableFile(executable)) {
+        return false;
+    }
+
+    ProcessRunOptions options;
+    options.executable = executable;
+    options.arguments = {L"--version"};
+    options.timeoutMs = 15000;
+
+    const ProcessRunResult result = ProcessRunner::Run(options);
+    if (result.canceled || result.timedOut || result.exitCode != 0) {
+        return false;
+    }
+
+    std::wstring version = result.stdoutText.empty() ? result.stderrText : result.stdoutText;
+    while (!version.empty() && iswspace(version.back())) {
+        version.pop_back();
+    }
+    while (!version.empty() && iswspace(version.front())) {
+        version.erase(version.begin());
+    }
+    if (version.empty()) {
+        return false;
+    }
+    if (expectedVersion.empty()) {
+        return true;
+    }
+    return NormalizeVersion(version) == NormalizeVersion(expectedVersion);
+}
+
 bool ShouldInstallAppUpdate(const ReleaseAssetInfo& latest) {
     return latest.found &&
            !latest.version.empty() &&
@@ -483,6 +515,10 @@ ReleaseAssetInfo YtDlpManager::CheckLatestRelease(HANDLE cancelEvent) const {
 
 ToolInstallStatus YtDlpManager::InstallOrUpdate(HANDLE cancelEvent) const {
     const ReleaseAssetInfo release = CheckLatestRelease(cancelEvent);
+    return InstallOrUpdate(release, cancelEvent);
+}
+
+ToolInstallStatus YtDlpManager::InstallOrUpdate(const ReleaseAssetInfo& release, HANDLE cancelEvent) const {
     if (!release.found) {
         throw std::runtime_error("yt-dlp release asset was not found");
     }
@@ -496,6 +532,10 @@ ToolInstallStatus YtDlpManager::InstallOrUpdate(HANDLE cancelEvent) const {
     const std::uint64_t downloadedSize = static_cast<std::uint64_t>(std::filesystem::file_size(tmpPath, ec));
     if (ec) {
         throw std::runtime_error("failed to inspect downloaded yt-dlp executable");
+    }
+    if (!ValidateYtDlpExecutableVersion(tmpPath, release.version)) {
+        std::filesystem::remove(tmpPath, ec);
+        throw std::runtime_error("downloaded yt-dlp executable failed version validation");
     }
     CommitDownloadedFile(tmpPath, m_paths.ytDlpExePath(), downloadedSize, downloadedSize);
     WriteTextFile(m_paths.ytDlpVersionPath(), release.version);

@@ -1980,7 +1980,7 @@ void Application::StartToolCheck() {
                 result.latestRelease = manager.CheckLatestRelease(cancelEvent.get());
                 result.latestCheckAt = CurrentUtcTimestamp();
                 if (ShouldInstallYtDlpUpdate(result.status, result.latestRelease)) {
-                    result.status = manager.InstallOrUpdate(cancelEvent.get());
+                    result.status = manager.InstallOrUpdate(result.latestRelease, cancelEvent.get());
                 }
             } catch (...) {
                 if (!result.status.installed) {

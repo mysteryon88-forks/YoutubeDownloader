@@ -194,6 +194,12 @@ bool IsPersistedRunningState(DownloadTaskState state) {
            state == DownloadTaskState::Downloading;
 }
 
+bool ShouldReuseExistingTask(DownloadTaskState state) {
+    return state == DownloadTaskState::Queued ||
+           state == DownloadTaskState::Preparing ||
+           state == DownloadTaskState::Downloading;
+}
+
 DownloadTaskSnapshot NormalizeRestoredSnapshot(DownloadTaskSnapshot snapshot) {
     if (IsPersistedRunningState(snapshot.state)) {
         snapshot.state = DownloadTaskState::Canceled;
@@ -271,7 +277,7 @@ void DownloadQueue::SetMaxParallelDownloads(int maxParallelDownloads) {
 int DownloadQueue::Enqueue(const YtDlpDownloadRequest& request, std::wstring title, std::filesystem::path thumbnailPath) {
     std::lock_guard lock(m_mutex);
     for (auto& [id, task] : m_tasks) {
-        if (task.snapshot.request.url == request.url) {
+        if (task.snapshot.request.url == request.url && ShouldReuseExistingTask(task.snapshot.state)) {
             if (EnrichTaskMetadata(task.snapshot, std::move(title), std::move(thumbnailPath))) {
                 ++m_revision;
             }
@@ -706,8 +712,11 @@ void DownloadQueue::RecordTaskOutput(int id, const std::wstring& line) {
     if (it == m_tasks.end()) {
         return;
     }
+    const size_t before = it->second.snapshot.outputFiles.size();
     AddUniquePath(it->second.snapshot.outputFiles, ExtractKnownOutputPath(line));
-    ++m_revision;
+    if (it->second.snapshot.outputFiles.size() != before) {
+        ++m_revision;
+    }
 }
 
 void DownloadQueue::FinishTask(int id, std::stop_token stopToken, const DownloadTaskResult& result) {

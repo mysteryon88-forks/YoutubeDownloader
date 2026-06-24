@@ -221,14 +221,10 @@ VideoPreview ParsePreviewObject(const nlohmann::json& object) {
     return preview;
 }
 
-std::vector<std::wstring> BuildMetadataArguments(const std::wstring& url, const std::filesystem::path& cookiesPath, bool playlist) {
+std::vector<std::wstring> BuildMetadataArguments(const std::wstring& url, const std::filesystem::path& cookiesPath) {
     std::vector<std::wstring> args;
     args.push_back(L"--dump-single-json");
-    if (playlist) {
-        args.push_back(L"--flat-playlist");
-    } else {
-        args.push_back(L"--no-playlist");
-    }
+    args.push_back(L"--no-playlist");
     args.push_back(L"--no-warnings");
     if (!cookiesPath.empty() && std::filesystem::is_regular_file(cookiesPath)) {
         args.push_back(L"--cookies");
@@ -353,27 +349,13 @@ YtDlpClient::YtDlpClient(YtDlpClientOptions options)
 VideoPreview YtDlpClient::FetchPreview(const std::wstring& url, HANDLE cancelEvent) const {
     ProcessRunOptions options;
     options.executable = m_options.ytDlpExePath;
-    options.arguments = BuildMetadataArguments(url, m_options.cookiesPath, false);
+    options.arguments = BuildMetadataArguments(url, m_options.cookiesPath);
     options.timeoutMs = 30000;
     options.cancelEvent = cancelEvent;
 
     const ProcessRunResult result = ProcessRunner::Run(options);
     if (result.exitCode != 0) {
         throw std::runtime_error("yt-dlp preview failed");
-    }
-    return ParseVideoPreviewJson(WideToUtf8(result.stdoutText));
-}
-
-VideoPreview YtDlpClient::ExpandPlaylist(const std::wstring& url, HANDLE cancelEvent) const {
-    ProcessRunOptions options;
-    options.executable = m_options.ytDlpExePath;
-    options.arguments = BuildMetadataArguments(url, m_options.cookiesPath, true);
-    options.timeoutMs = 60000;
-    options.cancelEvent = cancelEvent;
-
-    const ProcessRunResult result = ProcessRunner::Run(options);
-    if (result.exitCode != 0) {
-        throw std::runtime_error("yt-dlp playlist expansion failed");
     }
     return ParseVideoPreviewJson(WideToUtf8(result.stdoutText));
 }

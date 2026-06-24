@@ -55,6 +55,7 @@ struct ToolInstallStatus {
 };
 
 bool ShouldInstallYtDlpUpdate(const ToolInstallStatus& current, const ReleaseAssetInfo& latest);
+bool ValidateYtDlpExecutableVersion(const std::filesystem::path& executable, const std::wstring& expectedVersion);
 bool ShouldInstallAppUpdate(const ReleaseAssetInfo& latest);
 std::wstring BuildAppUpdatePromptMessage(const ReleaseAssetInfo& release);
 
@@ -65,6 +66,7 @@ public:
     ToolInstallStatus Status() const;
     ReleaseAssetInfo CheckLatestRelease(HANDLE cancelEvent = nullptr) const;
     ToolInstallStatus InstallOrUpdate(HANDLE cancelEvent = nullptr) const;
+    ToolInstallStatus InstallOrUpdate(const ReleaseAssetInfo& release, HANDLE cancelEvent = nullptr) const;
 
 private:
     AppPaths m_paths;

@@ -629,6 +629,26 @@ void TestProcessRunnerCapturesOutputAndExitCode() {
     Require(result.stderrText.find(L"stderr-line") != std::wstring::npos, "stderr was not captured");
 }
 
+void TestProcessRunnerEmitsEachOutputLineOnce() {
+    std::vector<std::wstring> lines;
+    ProcessRunOptions options;
+    options.executable = L"C:\\Windows\\System32\\cmd.exe";
+    options.arguments = {L"/C", L"for /L %i in (1,1,1000) do @echo line-%i"};
+    options.timeoutMs = 10000;
+    options.onStdoutLine = [&](const std::wstring& line) {
+        if (!line.empty()) {
+            lines.push_back(line);
+        }
+    };
+
+    const ProcessRunResult result = ProcessRunner::Run(options);
+
+    Require(result.exitCode == 0, "line fixture process failed");
+    Require(lines.size() == 1000, "stdout callback should emit each line once");
+    Require(std::ranges::count(lines, L"line-1") == 1, "first line was duplicated");
+    Require(std::ranges::count(lines, L"line-1000") == 1, "last line was duplicated");
+}
+
 void TestYtDlpMetadataParsing() {
     const std::string videoJson = R"json(
 {
@@ -1281,6 +1301,7 @@ int main() {
     TestFfmpegResolutionPrecedence();
     TestFfmpegUserPathAndExtractedTreeResolution();
     TestProcessRunnerCapturesOutputAndExitCode();
+    TestProcessRunnerEmitsEachOutputLineOnce();
     TestYtDlpMetadataParsing();
     TestDownloadQueueSchedulingAndRetry();
     TestDownloadQueueRejectsDuplicateVisibleUrl();

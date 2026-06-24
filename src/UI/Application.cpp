@@ -866,6 +866,9 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             if (m_paths && ShowSettingsDialog(m_window, m_instance, *m_paths, m_config)) {
                 ConfigStore::Save(*m_paths, m_config);
                 m_ffmpeg = FfmpegManager::Resolve(*m_paths, m_config);
+                if (m_downloadQueue) {
+                    m_downloadQueue->SetMaxParallelDownloads(m_config.maxParallelDownloads);
+                }
                 SetTransientStatus(L"Настройки сохранены");
             }
             return 0;
@@ -1610,63 +1613,6 @@ void Application::InitializeBackend() {
 
     m_ffmpeg = FfmpegManager::Resolve(*m_paths, m_config);
     m_downloadQueue = std::make_unique<DownloadQueue>(m_config.maxParallelDownloads);
-    m_downloadQueue->SetExecutor([this](const DownloadTaskSnapshot& task, const DownloadTaskCallbacks& callbacks) {
-        ProcessRunOptions options;
-        options.executable = task.request.ytDlpExePath;
-        options.arguments = BuildDownloadArguments(task.request);
-        options.timeoutMs = INFINITE;
-
-        HANDLE cancelEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        std::atomic<bool> monitorDone = false;
-        std::thread cancelMonitor([&]() {
-            while (!monitorDone.load()) {
-                if (callbacks.isCanceled && callbacks.isCanceled()) {
-                    SetEvent(cancelEvent);
-                    break;
-                }
-                Sleep(50);
-            }
-        });
-        options.cancelEvent = cancelEvent;
-        options.onStdoutLine = [callbacks](const std::wstring& line) {
-            if (callbacks.onOutputLine) {
-                callbacks.onOutputLine(line);
-            }
-            const YtDlpProgress progress = ParseYtDlpProgressLine(line);
-            if (progress.recognized && callbacks.onProgressDetails) {
-                callbacks.onProgressDetails(progress);
-            }
-        };
-        options.onStderrLine = callbacks.onOutputLine;
-
-        ProcessRunResult result;
-        try {
-            result = ProcessRunner::Run(options);
-        } catch (const std::exception& ex) {
-            monitorDone = true;
-            SetEvent(cancelEvent);
-            if (cancelMonitor.joinable()) {
-                cancelMonitor.join();
-            }
-            CloseHandle(cancelEvent);
-            return DownloadTaskResult{false, std::wstring(ex.what(), ex.what() + std::strlen(ex.what())), {}};
-        }
-
-        monitorDone = true;
-        SetEvent(cancelEvent);
-        if (cancelMonitor.joinable()) {
-            cancelMonitor.join();
-        }
-        CloseHandle(cancelEvent);
-
-        if (result.canceled) {
-            return DownloadTaskResult{false, L"Отменено", {}};
-        }
-        if (result.exitCode != 0) {
-            return DownloadTaskResult{false, result.stderrText.empty() ? result.stdoutText : result.stderrText, {}};
-        }
-        return DownloadTaskResult{true, L"", {}};
-    });
 
     SetTimer(m_window, kQueueRefreshTimer, 500, nullptr);
     SetStatus(L"Проверка yt-dlp...");

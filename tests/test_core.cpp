@@ -320,6 +320,18 @@ void TestConfigUtf8RoundTrip() {
     Require(loaded.lastYtDlpVersion == L"2026.06.17", "utf8 version round-trip mismatch");
 }
 
+template <typename Predicate>
+bool WaitUntil(Predicate predicate, std::chrono::milliseconds timeout = std::chrono::seconds(2)) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (predicate()) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return predicate();
+}
+
 void TestLoggerTruncatesAtStartupAndAppendsWithinRun() {
     const fs::path root = MakeTempRoot(L"YoutubeDownloaderTests_Logger");
     const AppPaths paths(root);
@@ -766,6 +778,79 @@ void TestDownloadQueueSchedulingAndRetry() {
     queue.WaitForIdle();
     Require(queue.GetTask(failing).state == DownloadTaskState::Completed, "retried task should complete");
     Require(attempts.load() >= 5, "executor attempt count mismatch");
+}
+
+void TestDownloadQueueShutdownWaitsForActiveWorker() {
+    std::atomic<bool> started = false;
+    std::atomic<bool> finished = false;
+    {
+        DownloadQueue queue(1);
+        queue.SetExecutor([&](
+            const DownloadTaskSnapshot& task,
+            std::stop_token stopToken,
+            const DownloadTaskCallbacks& callbacks
+        ) {
+            UNREFERENCED_PARAMETER(task);
+            UNREFERENCED_PARAMETER(stopToken);
+            UNREFERENCED_PARAMETER(callbacks);
+            started = true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(120));
+            finished = true;
+            return DownloadTaskResult{false, L"stopped", {}};
+        });
+
+        YtDlpDownloadRequest request;
+        request.url = L"https://example.invalid/shutdown";
+        queue.Enqueue(request, L"Shutdown");
+        Require(WaitUntil([&]() { return started.load(); }), "shutdown fixture did not start");
+    }
+    Require(finished.load(), "queue destruction should join active workers");
+}
+
+void TestDownloadQueueUpdatesParallelismAtRuntime() {
+    std::atomic<int> started = 0;
+    std::atomic<int> running = 0;
+    std::atomic<int> maxRunning = 0;
+    std::atomic<bool> release = false;
+
+    DownloadQueue queue(1);
+    queue.SetExecutor([&](
+        const DownloadTaskSnapshot& task,
+        std::stop_token stopToken,
+        const DownloadTaskCallbacks& callbacks
+    ) {
+        UNREFERENCED_PARAMETER(task);
+        UNREFERENCED_PARAMETER(callbacks);
+        ++started;
+        const int now = ++running;
+        int observed = maxRunning.load();
+        while (now > observed && !maxRunning.compare_exchange_weak(observed, now)) {
+        }
+        while (!release.load() && !stopToken.stop_requested()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        --running;
+        return DownloadTaskResult{true, L"", {}};
+    });
+
+    for (int index = 0; index < 3; ++index) {
+        YtDlpDownloadRequest request;
+        request.url = L"https://example.invalid/parallel-" + std::to_wstring(index);
+        queue.Enqueue(request, L"Parallel");
+    }
+
+    Require(WaitUntil([&]() { return started.load() == 1; }), "initial parallel limit was not applied");
+    queue.SetMaxParallelDownloads(2);
+    Require(WaitUntil([&]() { return started.load() == 2; }), "increased parallel limit was not applied immediately");
+
+    queue.SetMaxParallelDownloads(1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    Require(started.load() == 2, "lowered parallel limit should not start another task");
+    Require(maxRunning.load() == 2, "runtime parallel limit should permit exactly two active tasks");
+
+    release = true;
+    queue.WaitForIdle();
+    Require(started.load() == 3, "queued work should resume after active tasks finish");
 }
 
 void TestDownloadQueueRejectsDuplicateVisibleUrl() {
@@ -1304,6 +1389,8 @@ int main() {
     TestProcessRunnerEmitsEachOutputLineOnce();
     TestYtDlpMetadataParsing();
     TestDownloadQueueSchedulingAndRetry();
+    TestDownloadQueueShutdownWaitsForActiveWorker();
+    TestDownloadQueueUpdatesParallelismAtRuntime();
     TestDownloadQueueRejectsDuplicateVisibleUrl();
     TestDownloadQueueEnrichesDuplicateVisibleUrl();
     TestDownloadQueueEnrichesExistingTaskAfterPreviewCompletes();

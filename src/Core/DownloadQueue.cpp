@@ -191,8 +191,12 @@ bool EnrichTaskMetadata(DownloadTaskSnapshot& task, std::wstring title, std::fil
 
 DownloadQueue::DownloadQueue(int maxParallelDownloads)
     : m_maxParallelDownloads(std::max(1, maxParallelDownloads)),
-      m_executor([this](const DownloadTaskSnapshot& task, const DownloadTaskCallbacks& callbacks) {
-          return DefaultExecutor(task, callbacks);
+      m_executor([this](
+          const DownloadTaskSnapshot& task,
+          std::stop_token stopToken,
+          const DownloadTaskCallbacks& callbacks
+      ) {
+          return DefaultExecutor(task, stopToken, callbacks);
       }),
       m_scheduler(&DownloadQueue::SchedulerLoop, this) {
 }
@@ -204,6 +208,25 @@ DownloadQueue::~DownloadQueue() {
 void DownloadQueue::SetExecutor(DownloadTaskExecutor executor) {
     std::lock_guard lock(m_mutex);
     m_executor = std::move(executor);
+}
+
+void DownloadQueue::SetExecutor(LegacyDownloadTaskExecutor executor) {
+    SetExecutor([executor = std::move(executor)](
+        const DownloadTaskSnapshot& task,
+        std::stop_token stopToken,
+        const DownloadTaskCallbacks& callbacks
+    ) {
+        UNREFERENCED_PARAMETER(stopToken);
+        return executor(task, callbacks);
+    });
+}
+
+void DownloadQueue::SetMaxParallelDownloads(int maxParallelDownloads) {
+    {
+        std::lock_guard lock(m_mutex);
+        m_maxParallelDownloads = std::max(1, maxParallelDownloads);
+    }
+    m_cv.notify_all();
 }
 
 int DownloadQueue::Enqueue(const YtDlpDownloadRequest& request, std::wstring title, std::filesystem::path thumbnailPath) {
@@ -261,6 +284,10 @@ bool DownloadQueue::Cancel(int id) {
     if (task.active) {
         task.cancelRequested = true;
         task.snapshot.statusText = L"Отмена...";
+        const auto worker = m_workers.find(id);
+        if (worker != m_workers.end()) {
+            worker->second.request_stop();
+        }
         ++m_revision;
         return true;
     }
@@ -393,6 +420,7 @@ void DownloadQueue::WaitForIdle() {
 }
 
 void DownloadQueue::Shutdown() {
+    std::map<int, std::jthread> workers;
     {
         std::lock_guard lock(m_mutex);
         if (m_shutdown) {
@@ -403,11 +431,44 @@ void DownloadQueue::Shutdown() {
             UNREFERENCED_PARAMETER(id);
             task.cancelRequested = true;
         }
+        for (auto& [id, worker] : m_workers) {
+            UNREFERENCED_PARAMETER(id);
+            worker.request_stop();
+        }
     }
     m_cv.notify_all();
     if (m_scheduler.joinable()) {
+        m_scheduler.request_stop();
         m_scheduler.join();
     }
+    {
+        std::lock_guard lock(m_mutex);
+        workers = std::move(m_workers);
+        m_finishedWorkerIds.clear();
+    }
+    for (auto& [id, worker] : workers) {
+        UNREFERENCED_PARAMETER(id);
+        worker.request_stop();
+    }
+    workers.clear();
+}
+
+void DownloadQueue::ReapFinishedWorkers(std::unique_lock<std::mutex>& lock) {
+    std::vector<std::jthread> finished;
+    finished.reserve(m_finishedWorkerIds.size());
+    for (int id : m_finishedWorkerIds) {
+        auto worker = m_workers.find(id);
+        if (worker == m_workers.end()) {
+            continue;
+        }
+        finished.push_back(std::move(worker->second));
+        m_workers.erase(worker);
+    }
+    m_finishedWorkerIds.clear();
+
+    lock.unlock();
+    finished.clear();
+    lock.lock();
 }
 
 void DownloadQueue::SchedulerLoop() {
@@ -415,6 +476,9 @@ void DownloadQueue::SchedulerLoop() {
         std::unique_lock lock(m_mutex);
         m_cv.wait(lock, [this]() {
             if (m_shutdown) {
+                return true;
+            }
+            if (!m_finishedWorkerIds.empty()) {
                 return true;
             }
             if (m_activeCount >= m_maxParallelDownloads) {
@@ -425,6 +489,11 @@ void DownloadQueue::SchedulerLoop() {
             });
         });
 
+        if (m_shutdown) {
+            break;
+        }
+
+        ReapFinishedWorkers(lock);
         if (m_shutdown) {
             break;
         }
@@ -442,12 +511,14 @@ void DownloadQueue::SchedulerLoop() {
             it->second.snapshot.statusText = L"Подготовка";
             ++m_revision;
             ++m_activeCount;
-            std::thread(&DownloadQueue::StartTask, this, id).detach();
+            m_workers.emplace(id, std::jthread([this, id](std::stop_token stopToken) {
+                StartTask(id, stopToken);
+            }));
         }
     }
 }
 
-void DownloadQueue::StartTask(int id) {
+void DownloadQueue::StartTask(int id, std::stop_token stopToken) {
     DownloadTaskSnapshot task;
     DownloadTaskExecutor executor;
     {
@@ -534,7 +605,7 @@ void DownloadQueue::StartTask(int id) {
 
     DownloadTaskResult result;
     try {
-        result = executor(task, callbacks);
+        result = executor(task, stopToken, callbacks);
     } catch (const std::exception& ex) {
         result.success = false;
         result.errorText.assign(ex.what(), ex.what() + std::strlen(ex.what()));
@@ -549,7 +620,7 @@ void DownloadQueue::StartTask(int id) {
         if (it != m_tasks.end()) {
             it->second.active = false;
             --m_activeCount;
-            if (it->second.cancelRequested) {
+            if (it->second.cancelRequested || stopToken.stop_requested()) {
                 it->second.snapshot.state = DownloadTaskState::Canceled;
                 it->second.snapshot.statusText = L"Отменено";
                 ++m_revision;
@@ -567,6 +638,7 @@ void DownloadQueue::StartTask(int id) {
                 it->second.snapshot.statusText = L"Ошибка";
                 ++m_revision;
             }
+            m_finishedWorkerIds.push_back(id);
         }
     }
     m_cv.notify_all();
@@ -574,12 +646,18 @@ void DownloadQueue::StartTask(int id) {
 
 DownloadTaskResult DownloadQueue::DefaultExecutor(
     const DownloadTaskSnapshot& task,
+    std::stop_token stopToken,
     const DownloadTaskCallbacks& callbacks
 ) {
     ProcessRunOptions options;
     options.executable = task.request.ytDlpExePath.empty() ? std::filesystem::path(L"yt-dlp.exe") : task.request.ytDlpExePath;
     options.arguments = BuildDownloadArguments(task.request);
     options.timeoutMs = INFINITE;
+    HANDLE cancelEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!cancelEvent) {
+        throw std::runtime_error("failed to create download cancellation event");
+    }
+    options.cancelEvent = cancelEvent;
     options.onStdoutLine = [callbacks](const std::wstring& line) {
         if (callbacks.onOutputLine) {
             callbacks.onOutputLine(line);
@@ -591,8 +669,18 @@ DownloadTaskResult DownloadQueue::DefaultExecutor(
     };
     options.onStderrLine = callbacks.onOutputLine;
 
-    const ProcessRunResult result = ProcessRunner::Run(options);
-    if (callbacks.isCanceled && callbacks.isCanceled()) {
+    ProcessRunResult result;
+    try {
+        std::stop_callback stopCallback(stopToken, [cancelEvent]() {
+            SetEvent(cancelEvent);
+        });
+        result = ProcessRunner::Run(options);
+    } catch (...) {
+        CloseHandle(cancelEvent);
+        throw;
+    }
+    CloseHandle(cancelEvent);
+    if (result.canceled || stopToken.stop_requested()) {
         return {false, L"Отменено", {}};
     }
     if (result.exitCode != 0) {

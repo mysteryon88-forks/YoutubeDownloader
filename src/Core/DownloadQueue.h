@@ -9,6 +9,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <thread>
 #include <vector>
@@ -59,6 +60,12 @@ struct DownloadTaskResult {
 
 using DownloadTaskExecutor = std::function<DownloadTaskResult(
     const DownloadTaskSnapshot& task,
+    std::stop_token stopToken,
+    const DownloadTaskCallbacks& callbacks
+)>;
+
+using LegacyDownloadTaskExecutor = std::function<DownloadTaskResult(
+    const DownloadTaskSnapshot& task,
     const DownloadTaskCallbacks& callbacks
 )>;
 
@@ -71,6 +78,8 @@ public:
     DownloadQueue& operator=(const DownloadQueue&) = delete;
 
     void SetExecutor(DownloadTaskExecutor executor);
+    void SetExecutor(LegacyDownloadTaskExecutor executor);
+    void SetMaxParallelDownloads(int maxParallelDownloads);
     int Enqueue(const YtDlpDownloadRequest& request, std::wstring title, std::filesystem::path thumbnailPath = {});
     bool EnrichMetadata(const std::wstring& url, std::wstring title, std::filesystem::path thumbnailPath = {});
     bool Cancel(int id);
@@ -93,8 +102,13 @@ private:
     };
 
     void SchedulerLoop();
-    void StartTask(int id);
-    DownloadTaskResult DefaultExecutor(const DownloadTaskSnapshot& task, const DownloadTaskCallbacks& callbacks);
+    void StartTask(int id, std::stop_token stopToken);
+    void ReapFinishedWorkers(std::unique_lock<std::mutex>& lock);
+    DownloadTaskResult DefaultExecutor(
+        const DownloadTaskSnapshot& task,
+        std::stop_token stopToken,
+        const DownloadTaskCallbacks& callbacks
+    );
 
     int m_maxParallelDownloads = 1;
     int m_nextId = 1;
@@ -104,6 +118,8 @@ private:
     mutable std::mutex m_mutex;
     std::condition_variable m_cv;
     std::map<int, TaskRecord> m_tasks;
-    std::thread m_scheduler;
+    std::map<int, std::jthread> m_workers;
+    std::vector<int> m_finishedWorkerIds;
+    std::jthread m_scheduler;
     DownloadTaskExecutor m_executor;
 };

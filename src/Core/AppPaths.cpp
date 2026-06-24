@@ -8,10 +8,6 @@ const std::filesystem::path& AppPaths::root() const {
     return m_root;
 }
 
-std::filesystem::path AppPaths::assetsDir() const {
-    return m_root / L"assets";
-}
-
 std::filesystem::path AppPaths::stuffDir() const {
     return m_root / L"stuff";
 }
@@ -22,6 +18,10 @@ std::filesystem::path AppPaths::configPath() const {
 
 std::filesystem::path AppPaths::logPath() const {
     return stuffDir() / L"ytdl.log";
+}
+
+std::filesystem::path AppPaths::downloadQueuePath() const {
+    return stuffDir() / L"download_queue.json";
 }
 
 std::filesystem::path AppPaths::thumbCacheDir() const {

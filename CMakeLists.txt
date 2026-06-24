@@ -25,9 +25,12 @@ endif()
 set(CORE_SOURCES
     src/Core/AppPaths.cpp
     src/Core/AppVersion.h
+    src/Core/AsyncWait.cpp
     src/Core/BackendText.cpp
     src/Core/Config.cpp
     src/Core/DownloadQueue.cpp
+    src/Core/DownloadQueueStore.cpp
+    src/Core/FileOperations.cpp
     src/Core/KeyboardShortcuts.cpp
     src/Core/Logger.cpp
     src/Core/ToolManagers.cpp
@@ -41,9 +44,12 @@ set(CORE_SOURCES
 set(CORE_HEADERS
     src/Core/AppPaths.h
     src/Core/AppVersion.h
+    src/Core/AsyncWait.h
     src/Core/BackendText.h
     src/Core/Config.h
     src/Core/DownloadQueue.h
+    src/Core/DownloadQueueStore.h
+    src/Core/FileOperations.h
     src/Core/KeyboardShortcuts.h
     src/Core/Logger.h
     src/Core/ToolManagers.h

@@ -26,6 +26,9 @@ const Color kInput(255, 25, 25, 28);
 const Color kAccent(255, 232, 72, 85);
 const Color kAccentPressed(255, 197, 45, 59);
 const Color kText(255, 242, 242, 242);
+constexpr int kPopupItemHeight = 34;
+constexpr int kPopupSeparatorHeight = 10;
+constexpr int kPopupTextPaddingLeft = 14;
 
 void AddRoundedRect(GraphicsPath& path, const RECT& rect, int radius) {
     const int diameter = radius * 2;
@@ -112,7 +115,16 @@ void UiRenderer::DrawProgressBar(HDC dc, const RECT& rect, double percent) {
     graphics.FillPath(&fillBrush, &fillPath);
 }
 
-void UiRenderer::DrawButton(HDC dc, const RECT& rect, const wchar_t* text, bool primary, bool pressed, bool hot, bool onPanel) {
+void UiRenderer::DrawButton(
+    HDC dc,
+    const RECT& rect,
+    const wchar_t* text,
+    bool primary,
+    bool pressed,
+    bool hot,
+    bool onPanel,
+    bool enabled
+) {
     Graphics graphics(dc);
     graphics.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
     graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
@@ -130,17 +142,19 @@ void UiRenderer::DrawButton(HDC dc, const RECT& rect, const wchar_t* text, bool 
     RECT inset = {rect.left + 1, rect.top + 1, rect.right - 1, rect.bottom - 1};
     AddRoundedRect(path, inset, 7);
 
-    const Color fillColor = primary
+    const Color fillColor = !enabled
+        ? Color(255, 36, 36, 39)
+        : primary
         ? (pressed ? kAccentPressed : (hot ? Color(255, 242, 88, 101) : kAccent))
         : (pressed ? Color(255, 30, 30, 33) : (hot ? Color(255, 42, 42, 46) : kPanel2));
     SolidBrush fill(fillColor);
-    Pen border(primary ? fillColor : kBorder, 1.0f);
+    Pen border((enabled && primary) ? fillColor : kBorder, 1.0f);
     graphics.FillPath(&fill, &path);
     graphics.DrawPath(&border, &path);
 
     FontFamily family(L"Segoe UI");
     Font font(&family, 10.0f, Gdiplus::FontStyleRegular, UnitPoint);
-    SolidBrush textBrush(kText);
+    SolidBrush textBrush(enabled ? kText : Color(255, 136, 136, 142));
     RectF textRect(
         static_cast<Gdiplus::REAL>(rect.left),
         static_cast<Gdiplus::REAL>(rect.top),
@@ -151,4 +165,88 @@ void UiRenderer::DrawButton(HDC dc, const RECT& rect, const wchar_t* text, bool 
     format.SetAlignment(StringAlignment::StringAlignmentCenter);
     format.SetLineAlignment(StringAlignment::StringAlignmentCenter);
     graphics.DrawString(text, -1, &font, textRect, &format, &textBrush);
+}
+
+void UiRenderer::DrawPopupMenu(HDC dc, const RECT& rect, const std::vector<PopupMenuItem>& items, UINT hoveredItemId) {
+    if (!dc) {
+        return;
+    }
+
+    HBRUSH backgroundBrush = CreateSolidBrush(RGB(45, 45, 45));
+    FillRect(dc, &rect, backgroundBrush);
+    DeleteObject(backgroundBrush);
+
+    HPEN outerBorderPen = CreatePen(PS_SOLID, 1, RGB(22, 22, 24));
+    HPEN oldPen = static_cast<HPEN>(SelectObject(dc, outerBorderPen));
+    MoveToEx(dc, rect.left, rect.top, nullptr);
+    LineTo(dc, rect.right - 1, rect.top);
+    LineTo(dc, rect.right - 1, rect.bottom - 1);
+    LineTo(dc, rect.left, rect.bottom - 1);
+    LineTo(dc, rect.left, rect.top);
+    SelectObject(dc, oldPen);
+    DeleteObject(outerBorderPen);
+
+    RECT innerBorder = {rect.left + 1, rect.top + 1, rect.right - 1, rect.bottom - 1};
+    HPEN borderPen = CreatePen(PS_SOLID, 1, RGB(82, 82, 86));
+    oldPen = static_cast<HPEN>(SelectObject(dc, borderPen));
+    MoveToEx(dc, innerBorder.left, innerBorder.top, nullptr);
+    LineTo(dc, innerBorder.right - 1, innerBorder.top);
+    LineTo(dc, innerBorder.right - 1, innerBorder.bottom - 1);
+    LineTo(dc, innerBorder.left, innerBorder.bottom - 1);
+    LineTo(dc, innerBorder.left, innerBorder.top);
+    SelectObject(dc, oldPen);
+    DeleteObject(borderPen);
+
+    HFONT font = CreateFontW(
+        -13,
+        0,
+        0,
+        0,
+        FW_NORMAL,
+        FALSE,
+        FALSE,
+        FALSE,
+        DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS,
+        CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_DONTCARE,
+        L"Segoe UI"
+    );
+    HFONT oldFont = static_cast<HFONT>(SelectObject(dc, font));
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(235, 235, 235));
+
+    int top = 2;
+    for (const PopupMenuItem& item : items) {
+        const int itemHeight = item.separator ? kPopupSeparatorHeight : kPopupItemHeight;
+        RECT itemRect = {rect.left + 2, rect.top + top, rect.right - 2, rect.top + top + itemHeight};
+        top += itemHeight;
+
+        if (item.separator) {
+            HPEN separatorPen = CreatePen(PS_SOLID, 1, RGB(78, 78, 78));
+            HPEN oldSeparatorPen = static_cast<HPEN>(SelectObject(dc, separatorPen));
+            const int y = (itemRect.top + itemRect.bottom) / 2;
+            MoveToEx(dc, itemRect.left + 11, y, nullptr);
+            LineTo(dc, itemRect.right - 11, y);
+            SelectObject(dc, oldSeparatorPen);
+            DeleteObject(separatorPen);
+            continue;
+        }
+
+        if (item.enabled && item.id == hoveredItemId) {
+            HBRUSH selectedBrush = CreateSolidBrush(RGB(66, 66, 66));
+            FillRect(dc, &itemRect, selectedBrush);
+            DeleteObject(selectedBrush);
+        }
+
+        RECT textRect = itemRect;
+        textRect.left += kPopupTextPaddingLeft;
+        textRect.right -= 10;
+        SetTextColor(dc, item.enabled ? RGB(235, 235, 235) : RGB(128, 128, 132));
+        DrawTextW(dc, item.text.c_str(), -1, &textRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+
+    SelectObject(dc, oldFont);
+    DeleteObject(font);
 }

@@ -1,8 +1,11 @@
 #include "Application.h"
 
+#include "AsyncWait.h"
 #include "BackendText.h"
 #include "DialogWindows.h"
+#include "DownloadQueueStore.h"
 #include "KeyboardShortcuts.h"
+#include "ProcessRunner.h"
 #include "resource.h"
 #include "TranscriptionClient.h"
 #include "UiActions.h"
@@ -17,14 +20,13 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <functional>
 #include <system_error>
 #include <thread>
 #include <vector>
-
-#include "ProcessRunner.h"
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "gdiplus.lib")
@@ -33,6 +35,8 @@ namespace {
 
 constexpr const wchar_t* kWindowClassName = L"YoutubeDownloaderWin32Class";
 constexpr const wchar_t* kButtonClassName = L"YoutubeDownloaderButtonClass";
+constexpr const wchar_t* kQueueErrorMenuClassName = L"YoutubeDownloaderQueueErrorMenu";
+constexpr const wchar_t* kEditContextMenuClassName = L"YoutubeDownloaderEditContextMenu";
 constexpr int kInitialWindowWidth = 1000;
 constexpr int kInitialWindowHeight = 640;
 constexpr COLORREF kBackgroundColor = RGB(20, 20, 22);
@@ -68,7 +72,8 @@ enum ControlId {
     IdDownloadButton = 1004,
     IdClearButton = 1005,
     IdSettingsButton = 1006,
-    IdClearFinishedButton = 1007
+    IdClearFinishedButton = 1007,
+    IdLogsButton = 1008
 };
 
 struct ButtonState {
@@ -77,30 +82,53 @@ struct ButtonState {
     bool onPanel = false;
     bool hot = false;
     bool pressed = false;
+    bool enabled = true;
     std::wstring text;
 };
 
-struct ToolCheckResult {
-    bool ready = false;
-    ToolInstallStatus status;
-    ReleaseAssetInfo latestRelease;
-    std::wstring latestCheckAt;
-    std::wstring message;
+struct QueueErrorMenuState {
+    HWND owner = nullptr;
+    std::wstring errorText;
+    bool hot = false;
 };
 
-struct PreviewFetchResult {
-    unsigned long requestId = 0;
-    std::wstring url;
-    bool ok = false;
-    VideoPreview preview;
-    std::wstring error;
+struct EditContextMenuState {
+    HWND owner = nullptr;
+    HWND edit = nullptr;
+    std::vector<EditContextMenuItem> items;
+    UINT hotItemId = 0;
 };
 
-struct AppUpdateCheckResult {
-    bool ok = false;
-    ReleaseAssetInfo release;
-    std::wstring error;
+struct EditSubclassState {
+    HWND owner = nullptr;
+    HINSTANCE instance = nullptr;
 };
+
+class UniqueHandle {
+public:
+    explicit UniqueHandle(HANDLE handle = nullptr) : m_handle(handle) {}
+    ~UniqueHandle() {
+        if (m_handle && m_handle != INVALID_HANDLE_VALUE) {
+            CloseHandle(m_handle);
+        }
+    }
+
+    UniqueHandle(const UniqueHandle&) = delete;
+    UniqueHandle& operator=(const UniqueHandle&) = delete;
+
+    HANDLE get() const { return m_handle; }
+
+private:
+    HANDLE m_handle = nullptr;
+};
+
+void StopAndJoin(std::jthread& worker) {
+    if (!worker.joinable()) {
+        return;
+    }
+    worker.request_stop();
+    worker.join();
+}
 
 HWND CreateChild(HWND parent, const wchar_t* className, const wchar_t* text, DWORD style, DWORD exStyle, int id) {
     return CreateWindowExW(
@@ -147,8 +175,6 @@ std::wstring TaskStateText(DownloadTaskState state) {
         return L"Подготовка";
     case DownloadTaskState::Downloading:
         return L"Скачивание";
-    case DownloadTaskState::PostProcessing:
-        return L"Обработка";
     case DownloadTaskState::Completed:
         return L"Готово";
     case DownloadTaskState::Failed:
@@ -162,8 +188,7 @@ std::wstring TaskStateText(DownloadTaskState state) {
 bool IsRunningTaskState(DownloadTaskState state) {
     return state == DownloadTaskState::Queued ||
            state == DownloadTaskState::Preparing ||
-           state == DownloadTaskState::Downloading ||
-           state == DownloadTaskState::PostProcessing;
+           state == DownloadTaskState::Downloading;
 }
 
 void AddRoundedRect(Gdiplus::GraphicsPath& path, const RECT& rect, int radius) {
@@ -233,7 +258,7 @@ std::wstring BuildTaskDetails(const DownloadTaskSnapshot& task) {
         parts.push_back(FormatBytes(task.speedBytesPerSecond) + L"/s");
     }
     if (task.etaSeconds > 0) {
-        parts.push_back(L"ETA " + std::to_wstring(task.etaSeconds) + L"с");
+        parts.push_back(L"ETA " + FormatDuration(task.etaSeconds));
     }
 
     std::wstring details;
@@ -593,6 +618,336 @@ void AddTooltip(HWND tooltip, HWND parent, HWND tool, const wchar_t* text) {
     SendMessageW(tooltip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&info));
 }
 
+void CachePreviewThumbnailTree(YtDlpClient& client, VideoPreview& preview, HANDLE cancelEvent) {
+    if (cancelEvent && WaitForSingleObject(cancelEvent, 0) == WAIT_OBJECT_0) {
+        return;
+    }
+    if (!preview.thumbnailUrl.empty()) {
+        try {
+            preview.cachedThumbnailPath = client.CacheThumbnail(preview, cancelEvent);
+        } catch (...) {
+            preview.cachedThumbnailPath.clear();
+        }
+    }
+    for (VideoPreview& entry : preview.entries) {
+        if (cancelEvent && WaitForSingleObject(cancelEvent, 0) == WAIT_OBJECT_0) {
+            return;
+        }
+        CachePreviewThumbnailTree(client, entry, cancelEvent);
+    }
+}
+
+LRESULT CALLBACK QueueErrorMenuProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    QueueErrorMenuState* state = reinterpret_cast<QueueErrorMenuState*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        const CREATESTRUCTW* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        state = static_cast<QueueErrorMenuState*>(create->lpCreateParams);
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+        return TRUE;
+    }
+
+    switch (message) {
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_MOUSEMOVE:
+        if (state && !state->hot) {
+            state->hot = true;
+            TRACKMOUSEEVENT track = {};
+            track.cbSize = sizeof(track);
+            track.dwFlags = TME_LEAVE;
+            track.hwndTrack = window;
+            TrackMouseEvent(&track);
+            InvalidateRect(window, nullptr, FALSE);
+        }
+        return 0;
+
+    case WM_MOUSELEAVE:
+        if (state && state->hot) {
+            state->hot = false;
+            InvalidateRect(window, nullptr, FALSE);
+        }
+        return 0;
+
+    case WM_PAINT:
+        PaintBuffered(window, [state](HDC dc, const RECT& client) {
+            const std::vector<UiRenderer::PopupMenuItem> items = {
+                {1, L"Скопировать ошибку", false}
+            };
+            UiRenderer::DrawPopupMenu(dc, client, items, state && state->hot ? 1 : 0);
+        });
+        return 0;
+
+    case WM_LBUTTONUP:
+        if (state && !state->errorText.empty()) {
+            CopyTextToClipboard(state->owner ? state->owner : window, state->errorText);
+        }
+        DestroyWindow(window);
+        return 0;
+
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE) {
+            DestroyWindow(window);
+            return 0;
+        }
+        if (wParam == VK_RETURN || wParam == VK_SPACE) {
+            if (state && !state->errorText.empty()) {
+                CopyTextToClipboard(state->owner ? state->owner : window, state->errorText);
+            }
+            DestroyWindow(window);
+            return 0;
+        }
+        break;
+
+    case WM_KILLFOCUS:
+        DestroyWindow(window);
+        return 0;
+
+    case WM_NCDESTROY:
+        delete state;
+        SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+        return 0;
+    }
+
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+void ExecuteEditContextCommand(HWND edit, UINT commandId) {
+    if (!IsWindow(edit)) {
+        return;
+    }
+
+    switch (commandId) {
+    case IdEditMenuUndo:
+        SendMessageW(edit, EM_UNDO, 0, 0);
+        break;
+    case IdEditMenuCut:
+        SendMessageW(edit, WM_CUT, 0, 0);
+        break;
+    case IdEditMenuCopy:
+        SendMessageW(edit, WM_COPY, 0, 0);
+        break;
+    case IdEditMenuPaste:
+        SendMessageW(edit, WM_PASTE, 0, 0);
+        break;
+    case IdEditMenuDelete:
+        SendMessageW(edit, WM_CLEAR, 0, 0);
+        break;
+    case IdEditMenuSelectAll:
+        SendMessageW(edit, EM_SETSEL, 0, -1);
+        break;
+    default:
+        break;
+    }
+}
+
+void ShowEditContextMenu(HWND owner, HINSTANCE instance, HWND edit, POINT screenPoint) {
+    if (!IsWindow(edit)) {
+        return;
+    }
+
+    DWORD selection = static_cast<DWORD>(SendMessageW(edit, EM_GETSEL, 0, 0));
+    const bool hasSelection = LOWORD(selection) != HIWORD(selection);
+    const bool hasText = GetWindowTextLengthW(edit) > 0;
+    const bool canUndo = SendMessageW(edit, EM_CANUNDO, 0, 0) != 0;
+    const bool canPaste = IsClipboardFormatAvailable(CF_UNICODETEXT) != 0;
+
+    auto* state = new EditContextMenuState{};
+    state->owner = owner;
+    state->edit = edit;
+    state->items = BuildEditContextMenuItems(canUndo, hasSelection, canPaste, hasText);
+
+    constexpr int menuWidth = 180;
+    const int menuHeight = EditContextMenuHeight(state->items);
+    RECT workArea = {};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+    const int x = std::max(
+        static_cast<int>(workArea.left),
+        std::min(static_cast<int>(screenPoint.x), static_cast<int>(workArea.right) - menuWidth)
+    );
+    const int y = std::max(
+        static_cast<int>(workArea.top),
+        std::min(static_cast<int>(screenPoint.y), static_cast<int>(workArea.bottom) - menuHeight)
+    );
+
+    HWND menu = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        kEditContextMenuClassName,
+        L"",
+        WS_POPUP,
+        x,
+        y,
+        menuWidth,
+        menuHeight,
+        owner,
+        nullptr,
+        instance,
+        state
+    );
+    if (!menu) {
+        delete state;
+        return;
+    }
+    ShowWindow(menu, SW_SHOW);
+    SetFocus(menu);
+}
+
+LRESULT CALLBACK EditContextMenuProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    EditContextMenuState* state = reinterpret_cast<EditContextMenuState*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        const CREATESTRUCTW* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        state = static_cast<EditContextMenuState*>(create->lpCreateParams);
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+        return TRUE;
+    }
+
+    switch (message) {
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_MOUSEMOVE:
+        if (state) {
+            const UINT hot = HitTestEditContextMenuItem(state->items, GET_Y_LPARAM(lParam));
+            if (hot != state->hotItemId) {
+                state->hotItemId = hot;
+                InvalidateRect(window, nullptr, FALSE);
+            }
+            TRACKMOUSEEVENT track = {};
+            track.cbSize = sizeof(track);
+            track.dwFlags = TME_LEAVE;
+            track.hwndTrack = window;
+            TrackMouseEvent(&track);
+        }
+        return 0;
+
+    case WM_MOUSELEAVE:
+        if (state && state->hotItemId != 0) {
+            state->hotItemId = 0;
+            InvalidateRect(window, nullptr, FALSE);
+        }
+        return 0;
+
+    case WM_PAINT:
+        PaintBuffered(window, [state](HDC dc, const RECT& client) {
+            std::vector<UiRenderer::PopupMenuItem> items;
+            if (state) {
+                items.reserve(state->items.size());
+                for (const EditContextMenuItem& item : state->items) {
+                    items.push_back({item.id, item.text, item.separator, item.enabled});
+                }
+            }
+            UiRenderer::DrawPopupMenu(dc, client, items, state ? state->hotItemId : 0);
+        });
+        return 0;
+
+    case WM_LBUTTONUP:
+        if (state) {
+            const UINT commandId = HitTestEditContextMenuItem(state->items, GET_Y_LPARAM(lParam));
+            if (IsWindow(state->edit)) {
+                SetFocus(state->edit);
+            }
+            if (commandId != 0) {
+                ExecuteEditContextCommand(state->edit, commandId);
+            }
+        }
+        DestroyWindow(window);
+        return 0;
+
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE) {
+            DestroyWindow(window);
+            return 0;
+        }
+        if (wParam == VK_RETURN || wParam == VK_SPACE) {
+            if (state && state->hotItemId != 0) {
+                if (IsWindow(state->edit)) {
+                    SetFocus(state->edit);
+                }
+                ExecuteEditContextCommand(state->edit, state->hotItemId);
+            }
+            DestroyWindow(window);
+            return 0;
+        }
+        break;
+
+    case WM_KILLFOCUS:
+        DestroyWindow(window);
+        return 0;
+
+    case WM_NCDESTROY:
+        delete state;
+        SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+        return 0;
+    }
+
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+LRESULT CALLBACK EditControlSubclassProc(
+    HWND window,
+    UINT message,
+    WPARAM wParam,
+    LPARAM lParam,
+    UINT_PTR subclassId,
+    DWORD_PTR refData
+) {
+    UNREFERENCED_PARAMETER(subclassId);
+    auto* state = reinterpret_cast<EditSubclassState*>(refData);
+
+    if (message == WM_CONTEXTMENU && state) {
+        SetFocus(window);
+        POINT screenPoint = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        if (screenPoint.x == -1 && screenPoint.y == -1) {
+            RECT rect = {};
+            GetWindowRect(window, &rect);
+            screenPoint = {rect.left + 16, rect.top + ((rect.bottom - rect.top) / 2)};
+        }
+        ShowEditContextMenu(state->owner, state->instance, window, screenPoint);
+        return 0;
+    }
+
+    if (message == WM_NCDESTROY) {
+        const LRESULT result = DefSubclassProc(window, message, wParam, lParam);
+        RemoveWindowSubclass(window, EditControlSubclassProc, 1);
+        delete state;
+        return result;
+    }
+
+    return DefSubclassProc(window, message, wParam, lParam);
+}
+
+void InstallCustomEditContextMenu(HWND edit, HWND owner, HINSTANCE instance) {
+    if (!IsWindow(edit)) {
+        return;
+    }
+    auto* state = new EditSubclassState{};
+    state->owner = owner;
+    state->instance = instance;
+    if (!SetWindowSubclass(edit, EditControlSubclassProc, 1, reinterpret_cast<DWORD_PTR>(state))) {
+        delete state;
+    }
+}
+
+void RegisterPopupMenuClasses(HINSTANCE instance) {
+    WNDCLASSEXW menuClass = {};
+    menuClass.cbSize = sizeof(menuClass);
+    menuClass.lpfnWndProc = QueueErrorMenuProc;
+    menuClass.hInstance = instance;
+    menuClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    menuClass.hbrBackground = nullptr;
+    menuClass.lpszClassName = kQueueErrorMenuClassName;
+    RegisterClassExW(&menuClass);
+
+    WNDCLASSEXW editMenuClass = {};
+    editMenuClass.cbSize = sizeof(editMenuClass);
+    editMenuClass.lpfnWndProc = EditContextMenuProc;
+    editMenuClass.hInstance = instance;
+    editMenuClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    editMenuClass.hbrBackground = nullptr;
+    editMenuClass.lpszClassName = kEditContextMenuClassName;
+    RegisterClassExW(&editMenuClass);
+}
+
 } // namespace
 
 Application::Application() = default;
@@ -622,6 +977,7 @@ bool Application::Initialize(HINSTANCE instance, int showCommand) {
         MessageBoxW(nullptr, L"Не удалось зарегистрировать класс кнопок.", L"YouTube Downloader", MB_OK | MB_ICONERROR);
         return false;
     }
+    RegisterPopupMenuClasses(m_instance);
 
     WNDCLASSEXW windowClass = {};
     windowClass.cbSize = sizeof(windowClass);
@@ -699,11 +1055,8 @@ bool Application::HandleMainWindowShortcut(const MSG& message) {
         PasteReplacingEditText(m_urlEdit);
         return true;
     case MainWindowShortcutAction::Download:
-        if (m_downloadButton && IsWindowEnabled(m_downloadButton)) {
-            EnqueueCurrentUrl();
-            return true;
-        }
-        return false;
+        EnqueueCurrentUrl();
+        return true;
     case MainWindowShortcutAction::None:
         return false;
     }
@@ -718,6 +1071,26 @@ void Application::RelayTooltipMessage(const MSG& message) {
 }
 
 void Application::Shutdown() {
+    if (m_shutdownStarted) {
+        return;
+    }
+    m_shutdownStarted = true;
+
+    if (m_logger) {
+        m_logger->Info(L"Application shutdown started");
+    }
+
+    StopAndJoin(m_previewWorker);
+    StopAndJoin(m_toolCheckWorker);
+    StopAndJoin(m_appUpdateWorker);
+    if (m_downloadQueue) {
+        SaveDownloadQueue(true);
+        m_downloadQueue->Shutdown();
+    }
+    if (m_logger) {
+        m_logger->Info(L"Application shutdown completed");
+    }
+
     if (m_font) {
         DeleteObject(m_font);
         m_font = nullptr;
@@ -742,10 +1115,10 @@ void Application::Shutdown() {
         Gdiplus::GdiplusShutdown(m_gdiplusToken);
         m_gdiplusToken = 0;
     }
-    if (m_downloadQueue) {
-        m_downloadQueue->Shutdown();
+    if (m_comInitialized) {
+        CoUninitialize();
+        m_comInitialized = false;
     }
-    CoUninitialize();
 }
 
 LRESULT CALLBACK Application::WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -779,8 +1152,20 @@ LRESULT CALLBACK Application::ButtonWindowProc(HWND window, UINT message, WPARAM
     case WM_ERASEBKGND:
         return 1;
 
+    case WM_ENABLE:
+        if (state) {
+            state->enabled = wParam != FALSE;
+            state->hot = false;
+            state->pressed = false;
+            if (GetCapture() == window) {
+                ReleaseCapture();
+            }
+            InvalidateRect(window, nullptr, TRUE);
+        }
+        return 0;
+
     case WM_MOUSEMOVE:
-        if (state && !state->hot) {
+        if (state && state->enabled && !state->hot) {
             state->hot = true;
             TRACKMOUSEEVENT track = {};
             track.cbSize = sizeof(track);
@@ -800,7 +1185,7 @@ LRESULT CALLBACK Application::ButtonWindowProc(HWND window, UINT message, WPARAM
         return 0;
 
     case WM_LBUTTONDOWN:
-        if (state) {
+        if (state && state->enabled) {
             state->pressed = true;
             SetCapture(window);
             SetFocus(window);
@@ -809,7 +1194,7 @@ LRESULT CALLBACK Application::ButtonWindowProc(HWND window, UINT message, WPARAM
         return 0;
 
     case WM_LBUTTONUP:
-        if (state) {
+        if (state && state->enabled) {
             if (GetCapture() == window) {
                 ReleaseCapture();
             }
@@ -828,7 +1213,7 @@ LRESULT CALLBACK Application::ButtonWindowProc(HWND window, UINT message, WPARAM
         return 0;
 
     case WM_KEYDOWN:
-        if (state && (wParam == VK_SPACE || wParam == VK_RETURN)) {
+        if (state && state->enabled && (wParam == VK_SPACE || wParam == VK_RETURN)) {
             HWND parent = GetParent(window);
             SendMessageW(parent, WM_COMMAND, MAKEWPARAM(state->commandId, BN_CLICKED), reinterpret_cast<LPARAM>(window));
             return 0;
@@ -842,7 +1227,16 @@ LRESULT CALLBACK Application::ButtonWindowProc(HWND window, UINT message, WPARAM
             RECT client = {};
             GetClientRect(window, &client);
             if (state) {
-                UiRenderer::DrawButton(dc, client, state->text.c_str(), state->primary, state->pressed, state->hot, state->onPanel);
+                UiRenderer::DrawButton(
+                    dc,
+                    client,
+                    state->text.c_str(),
+                    state->primary,
+                    state->pressed,
+                    state->hot,
+                    state->onPanel,
+                    state->enabled
+                );
             }
             EndPaint(window, &paint);
         }
@@ -879,6 +1273,27 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             POINT point = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
             if (HandleQueueClick(point)) {
                 return 0;
+            }
+        }
+        break;
+
+    case WM_RBUTTONUP:
+        {
+            POINT point = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            if (HandleQueueContextMenu(point)) {
+                return 0;
+            }
+        }
+        break;
+
+    case WM_CONTEXTMENU:
+        {
+            POINT point = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            if (point.x != -1 || point.y != -1) {
+                ScreenToClient(m_window, &point);
+                if (HandleQueueContextMenu(point)) {
+                    return 0;
+                }
             }
         }
         break;
@@ -982,6 +1397,9 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         if (LOWORD(wParam) == IdClearButton) {
             if (m_downloadQueue) {
                 const size_t removed = m_downloadQueue->ClearQueued();
+                if (m_logger) {
+                    m_logger->Info(L"Queued tasks cleared: count=" + std::to_wstring(removed));
+                }
                 SetTransientStatus(L"Очередь очищена: удалено " + std::to_wstring(removed) + L" задач");
                 RefreshQueueText();
             }
@@ -990,15 +1408,32 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         if (LOWORD(wParam) == IdClearFinishedButton) {
             if (m_downloadQueue) {
                 const size_t removed = m_downloadQueue->ClearFinished();
+                if (m_logger) {
+                    m_logger->Info(L"Finished tasks cleared: count=" + std::to_wstring(removed));
+                }
                 SetTransientStatus(L"Завершённые задачи очищены: удалено " + std::to_wstring(removed) + L" задач");
                 RefreshQueueText();
             }
+            return 0;
+        }
+        if (LOWORD(wParam) == IdLogsButton) {
+            const std::wstring logText = m_logger ? m_logger->ReadAll() : std::wstring{};
+            ShowLogsDialog(m_window, m_instance, logText);
             return 0;
         }
         if (LOWORD(wParam) == IdSettingsButton) {
             if (m_paths && ShowSettingsDialog(m_window, m_instance, *m_paths, m_config)) {
                 ConfigStore::Save(*m_paths, m_config);
                 m_ffmpeg = FfmpegManager::Resolve(*m_paths, m_config);
+                if (m_downloadQueue) {
+                    m_downloadQueue->SetMaxParallelDownloads(m_config.maxParallelDownloads);
+                }
+                if (m_logger) {
+                    m_logger->Info(
+                        L"Settings saved: max_parallel_downloads=" +
+                        std::to_wstring(m_config.maxParallelDownloads)
+                    );
+                }
                 SetTransientStatus(L"Настройки сохранены");
             }
             return 0;
@@ -1024,35 +1459,58 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
 
     case kMsgToolCheckComplete:
         {
-            std::unique_ptr<ToolCheckResult> result(reinterpret_cast<ToolCheckResult*>(lParam));
-            m_ytDlpReady = result->ready;
-            m_ytDlpStatus = result->status;
-            if (m_paths && result->latestRelease.found && !result->latestCheckAt.empty()) {
-                m_config.lastYtDlpCheckAt = result->latestCheckAt;
-                m_config.lastYtDlpVersion = result->latestRelease.version;
+            ToolCheckResult result;
+            {
+                std::lock_guard lock(m_asyncResultMutex);
+                if (!m_toolCheckResult) {
+                    return 0;
+                }
+                result = std::move(*m_toolCheckResult);
+                m_toolCheckResult.reset();
+            }
+            m_ytDlpReady = result.ready;
+            m_ytDlpStatus = result.status;
+            if (m_paths && result.latestRelease.found && !result.latestCheckAt.empty()) {
+                m_config.lastYtDlpCheckAt = result.latestCheckAt;
+                m_config.lastYtDlpVersion = result.latestRelease.version;
                 try {
                     ConfigStore::Save(*m_paths, m_config);
                 } catch (...) {
                     // The tool check result should still be usable even if config persistence fails.
                 }
             }
-            if (m_ytDlpReady && m_paths) {
-                YtDlpClientOptions options;
-                options.ytDlpExePath = m_ytDlpStatus.executable;
-                options.thumbCacheDir = m_paths->thumbCacheDir();
-                options.cookiesPath = m_config.cookiesPath;
-                m_ytDlpClient = std::make_unique<YtDlpClient>(std::move(options));
+            SetStatus(result.ready ? BuildToolReadyStatus(result.status, m_ffmpeg) : result.message);
+            if (m_logger) {
+                if (result.ready) {
+                    m_logger->Info(L"yt-dlp tool check completed: version=" + result.status.version);
+                } else {
+                    m_logger->Error(L"yt-dlp tool check failed: " + result.message);
+                }
             }
-            SetStatus(result->ready ? BuildToolReadyStatus(result->status, m_ffmpeg) : result->message);
         }
         return 0;
 
     case kMsgAppUpdateCheckComplete:
         {
-            std::unique_ptr<AppUpdateCheckResult> result(reinterpret_cast<AppUpdateCheckResult*>(lParam));
-            if (m_paths && result->ok && ShouldInstallAppUpdate(result->release)) {
-                if (OfferAppUpdate(m_window, m_instance, *m_paths, result->release, false)) {
+            AppUpdateCheckResult result;
+            {
+                std::lock_guard lock(m_asyncResultMutex);
+                if (!m_appUpdateCheckResult) {
+                    return 0;
+                }
+                result = std::move(*m_appUpdateCheckResult);
+                m_appUpdateCheckResult.reset();
+            }
+            if (m_paths && result.ok && ShouldInstallAppUpdate(result.release)) {
+                if (OfferAppUpdate(m_window, m_instance, *m_paths, result.release, false)) {
                     PostMessageW(m_window, WM_CLOSE, 0, 0);
+                }
+            }
+            if (m_logger) {
+                if (result.ok) {
+                    m_logger->Info(L"Application update check completed: version=" + result.release.version);
+                } else {
+                    m_logger->Error(L"Application update check failed: " + result.error);
                 }
             }
         }
@@ -1060,44 +1518,58 @@ LRESULT Application::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
 
     case kMsgPreviewComplete:
         {
-            std::unique_ptr<PreviewFetchResult> result(reinterpret_cast<PreviewFetchResult*>(lParam));
-            if (result->requestId != m_previewRequestId.load()) {
+            PreviewFetchResult result;
+            {
+                std::lock_guard lock(m_asyncResultMutex);
+                if (!m_previewFetchResult) {
+                    return 0;
+                }
+                result = std::move(*m_previewFetchResult);
+                m_previewFetchResult.reset();
+            }
+            if (result.requestId != m_previewRequestId.load()) {
                 return 0;
             }
             StopPreviewLoadingText();
-            if (result->ok) {
+            if (result.ok) {
                 {
                     std::lock_guard lock(m_previewMutex);
-                    m_preview = result->preview;
+                    m_preview = result.preview;
                 }
-                std::wstring title = result->preview.title.empty() ? L"Видео найдено" : result->preview.title;
-                if (result->preview.isPlaylist) {
-                    title += L" — плейлист: " + std::to_wstring(result->preview.entries.size()) + L" видео";
+                std::wstring title = result.preview.title.empty() ? L"Видео найдено" : result.preview.title;
+                if (result.preview.isPlaylist) {
+                    title += L" — плейлист: " + std::to_wstring(result.preview.entries.size()) + L" видео";
                 }
                 SetWindowTextW(m_previewTitle, title.c_str());
                 if (m_downloadQueue) {
                     bool enriched = m_downloadQueue->EnrichMetadata(
-                        result->url,
-                        result->preview.title,
-                        result->preview.cachedThumbnailPath
+                        result.url,
+                        result.preview.title,
+                        result.preview.cachedThumbnailPath
                     );
-                    if (!result->preview.webpageUrl.empty() && result->preview.webpageUrl != result->url) {
+                    if (!result.preview.webpageUrl.empty() && result.preview.webpageUrl != result.url) {
                         enriched = m_downloadQueue->EnrichMetadata(
-                            result->preview.webpageUrl,
-                            result->preview.title,
-                            result->preview.cachedThumbnailPath
+                            result.preview.webpageUrl,
+                            result.preview.title,
+                            result.preview.cachedThumbnailPath
                         ) || enriched;
                     }
                     if (enriched) {
                         RefreshQueueText();
                     }
                 }
+                if (m_logger) {
+                    m_logger->Info(L"Preview loaded: url=" + result.url);
+                }
             } else {
                 {
                     std::lock_guard lock(m_previewMutex);
                     m_preview = {};
                 }
-                SetWindowTextW(m_previewTitle, result->error.empty() ? L"Не удалось получить preview" : result->error.c_str());
+                SetWindowTextW(m_previewTitle, result.error.empty() ? L"Не удалось получить preview" : result.error.c_str());
+                if (m_logger) {
+                    m_logger->Error(L"Preview failed: url=" + result.url + L" error=" + result.error);
+                }
             }
             InvalidateRect(m_window, nullptr, FALSE);
         }
@@ -1167,6 +1639,7 @@ void Application::CreateControls() {
     m_boldFont = CreateFontIndirectW(&font);
 
     m_urlEdit = CreateChild(m_window, L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, 0, IdUrlEdit);
+    InstallCustomEditContextMenu(m_urlEdit, m_window, m_instance);
     SendMessageW(m_urlEdit, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"Ссылка на видео или плейлист"));
     SendMessageW(m_urlEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(10, 10));
     m_pasteButton = CreateButton(L"Вставить", IdPasteButton, false, false);
@@ -1180,12 +1653,14 @@ void Application::CreateControls() {
         0
     );
     m_folderEdit = CreateChild(m_window, L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, 0, 0);
+    InstallCustomEditContextMenu(m_folderEdit, m_window, m_instance);
     SendMessageW(m_folderEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(10, 10));
     SetWindowTextW(m_folderEdit, L"Downloads");
     m_chooseFolderButton = CreateButton(L"Выбрать...", IdChooseFolderButton, false, true);
 
     m_downloadButton = CreateButton(L"Скачать", IdDownloadButton, true, false);
     m_clearButton = CreateButton(L"Очистить очередь", IdClearButton, false, false);
+    m_logsButton = CreateButton(L"Логи", IdLogsButton, false, false);
     m_clearFinishedButton = CreateButton(L"X", IdClearFinishedButton, false, false);
     m_settingsButton = CreateButton(L"Настройки", IdSettingsButton, false, false);
     m_statusLabel = CreateChild(m_window, L"STATIC", L"Подготовка интерфейса", SS_LEFT, 0, 0);
@@ -1200,6 +1675,7 @@ void Application::CreateControls() {
     AddTooltip(m_tooltip, m_window, m_chooseFolderButton, L"Выберите папку для сохранения загрузок.");
     AddTooltip(m_tooltip, m_window, m_downloadButton, L"Добавляет ссылку в очередь загрузок.");
     AddTooltip(m_tooltip, m_window, m_clearButton, L"Удаляет из очереди задачи, которые ещё не начали загружаться. Активные загрузки не останавливаются.");
+    AddTooltip(m_tooltip, m_window, m_logsButton, L"Открывает текущий файл логов.");
     AddTooltip(m_tooltip, m_window, m_clearFinishedButton, L"Очищает из списка завершённые и ошибочные задачи. Файлы на диске не удаляются.");
     AddTooltip(m_tooltip, m_window, m_settingsButton, L"Открывает настройки качества, контейнера, FFmpeg и поведения приложения.");
 
@@ -1265,6 +1741,8 @@ void Application::LayoutControls(int width, int height) {
     MoveWindow(m_statusLabel, margin + 316, 246, width - (margin * 2) - 456, 22, TRUE);
 
     MoveWindow(m_queueLabel, margin, 298, 220, 22, TRUE);
+    const int clearFinishedLeft = width - margin - 34;
+    MoveWindow(m_logsButton, buttonX, 292, std::max(76, clearFinishedLeft - 8 - buttonX), 30, TRUE);
     MoveWindow(m_clearFinishedButton, width - margin - 34, 292, 34, 30, TRUE);
     MoveWindow(m_queuePlaceholder, margin + 24, 360, width - (margin * 2) - 48, 28, TRUE);
     InvalidateRect(m_window, nullptr, TRUE);
@@ -1525,50 +2003,39 @@ bool Application::StartTaskTranscription(const DownloadTaskSnapshot& task) {
 
     const bool started = m_downloadQueue->StartPostProcessing(
         task.id,
-        [mediaPath](const DownloadTaskSnapshot& currentTask, const DownloadTaskCallbacks& callbacks) {
+        [mediaPath](
+            const DownloadTaskSnapshot& currentTask,
+            std::stop_token stopToken,
+            const DownloadTaskCallbacks& callbacks
+        ) {
             HANDLE cancelEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
             if (!cancelEvent) {
                 return DownloadTaskResult{true, L"", currentTask.outputFiles, L"Готово · расшифровка не выполнена: не удалось создать событие отмены"};
             }
 
-            std::atomic<bool> monitorDone = false;
-            std::thread cancelMonitor([&]() {
-                while (!monitorDone.load()) {
-                    if (callbacks.isCanceled && callbacks.isCanceled()) {
-                        SetEvent(cancelEvent);
-                        break;
-                    }
-                    Sleep(50);
-                }
-            });
-
-            auto finish = [&](DownloadTaskResult result) {
-                monitorDone = true;
-                SetEvent(cancelEvent);
-                if (cancelMonitor.joinable()) {
-                    cancelMonitor.join();
-                }
-                CloseHandle(cancelEvent);
-                return result;
-            };
-
+            DownloadTaskResult result;
             try {
-                return finish(TranscribeDownloadedMedia(
+                std::stop_callback stopCallback(stopToken, [cancelEvent]() {
+                    SetEvent(cancelEvent);
+                });
+                result = TranscribeDownloadedMedia(
                     currentTask,
                     callbacks,
                     mediaPath,
                     currentTask.outputFiles,
                     cancelEvent
-                ));
+                );
             } catch (const std::exception& ex) {
-                return finish(DownloadTaskResult{
+                result = DownloadTaskResult{
                     false,
                     std::wstring(ex.what(), ex.what() + std::strlen(ex.what())),
                     currentTask.outputFiles
-                });
+                };
             } catch (...) {
-                return finish(DownloadTaskResult{false, L"Неизвестная ошибка", currentTask.outputFiles});
+                result = DownloadTaskResult{false, L"Неизвестная ошибка", currentTask.outputFiles};
             }
+            CloseHandle(cancelEvent);
+            return result;
         },
         L"Подготовка расшифровки"
     );
@@ -1626,6 +2093,7 @@ bool Application::HandleQueueClick(POINT point) {
 
         const DownloadTaskSnapshot& task = tasks[static_cast<size_t>(taskIndex)];
         bool handled = false;
+        bool removedRow = false;
         if (IsRunningTaskState(task.state) && PtInRect(&primaryButton, point)) {
             handled = m_downloadQueue->Cancel(task.id);
         } else if ((task.state == DownloadTaskState::Canceled || task.state == DownloadTaskState::Failed) &&
@@ -1643,13 +2111,90 @@ bool Application::HandleQueueClick(POINT point) {
                     task.state == DownloadTaskState::Completed) &&
                    PtInRect(&primaryButton, point)) {
             handled = m_downloadQueue->DeleteFiles(task.id);
+            removedRow = handled;
         }
 
         if (handled) {
+            if (removedRow && m_logger) {
+                m_logger->Info(L"Task row removed: id=" + std::to_wstring(task.id));
+            }
             RefreshQueueText();
             return true;
         }
         return false;
+    }
+
+    return false;
+}
+
+bool Application::HandleQueueContextMenu(POINT point) {
+    if (!m_downloadQueue) {
+        return false;
+    }
+
+    RECT client = {};
+    GetClientRect(m_window, &client);
+    const RECT queueRect = QueuePanelRectForClient(client);
+    if (!PtInRect(&queueRect, point)) {
+        return false;
+    }
+
+    const std::vector<DownloadTaskSnapshot> tasks = m_downloadQueue->Snapshot();
+    const int maxOffset = QueueMaxScrollOffset(queueRect, tasks.size());
+    m_queueScrollOffset = std::clamp(m_queueScrollOffset, 0, maxOffset);
+    const int maxY = queueRect.bottom - 16;
+    const int visibleRows = QueueVisibleRowCount(queueRect);
+    for (int visibleIndex = 0; visibleIndex < visibleRows; ++visibleIndex) {
+        const int taskIndex = m_queueScrollOffset + visibleIndex;
+        if (taskIndex >= static_cast<int>(tasks.size())) {
+            break;
+        }
+        const RECT row = QueueRowRectAt(queueRect, visibleIndex);
+        if (row.bottom > maxY) {
+            break;
+        }
+        if (!PtInRect(&row, point)) {
+            continue;
+        }
+
+        const DownloadTaskSnapshot& task = tasks[static_cast<size_t>(taskIndex)];
+        if (task.errorText.empty()) {
+            return false;
+        }
+
+        auto* menuState = new QueueErrorMenuState{};
+        menuState->owner = m_window;
+        menuState->errorText = task.errorText;
+
+        POINT screenPoint = point;
+        ClientToScreen(m_window, &screenPoint);
+        constexpr int menuWidth = 204;
+        constexpr int menuHeight = 36;
+        RECT workArea = {};
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+        const int x = std::min(static_cast<int>(screenPoint.x), static_cast<int>(workArea.right) - menuWidth);
+        const int y = std::min(static_cast<int>(screenPoint.y), static_cast<int>(workArea.bottom) - menuHeight);
+        HWND menu = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            kQueueErrorMenuClassName,
+            L"",
+            WS_POPUP,
+            std::max(static_cast<int>(workArea.left), x),
+            std::max(static_cast<int>(workArea.top), y),
+            menuWidth,
+            menuHeight,
+            m_window,
+            nullptr,
+            m_instance,
+            menuState
+        );
+        if (!menu) {
+            delete menuState;
+            return false;
+        }
+        ShowWindow(menu, SW_SHOW);
+        SetFocus(menu);
+        return true;
     }
 
     return false;
@@ -1772,7 +2317,7 @@ bool Application::ScrollQueue(int wheelDelta, POINT point) {
 }
 
 void Application::SetControlFonts() {
-    const std::array<HWND, 12> controls = {
+    const std::array<HWND, 13> controls = {
         m_urlEdit,
         m_pasteButton,
         m_previewTitle,
@@ -1780,6 +2325,7 @@ void Application::SetControlFonts() {
         m_chooseFolderButton,
         m_downloadButton,
         m_clearButton,
+        m_logsButton,
         m_clearFinishedButton,
         m_settingsButton,
         m_statusLabel,
@@ -1832,6 +2378,9 @@ void Application::RestoreStatusText() {
 void Application::StartPreviewLoadingText() {
     m_previewLoading = true;
     m_previewLoadingDots = 3;
+    if (m_downloadButton) {
+        EnableWindow(m_downloadButton, FALSE);
+    }
     {
         std::lock_guard lock(m_previewMutex);
         m_preview = {};
@@ -1848,6 +2397,9 @@ void Application::StopPreviewLoadingText() {
         KillTimer(m_window, kPreviewLoadingTimer);
     }
     m_previewLoading = false;
+    if (m_downloadButton) {
+        EnableWindow(m_downloadButton, TRUE);
+    }
 }
 
 void Application::UpdatePreviewLoadingText() {
@@ -1862,7 +2414,7 @@ void Application::UpdatePreviewLoadingText() {
 }
 
 void Application::InitializeBackend() {
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    m_comInitialized = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
 
     m_paths = std::make_unique<AppPaths>(GetExecutableRoot());
     std::error_code ec;
@@ -1871,14 +2423,19 @@ void Application::InitializeBackend() {
     std::filesystem::create_directories(m_paths->toolsDir(), ec);
 
     m_logger = std::make_unique<Logger>(*m_paths);
+    m_logger->Info(L"Application started: root=" + m_paths->root().wstring());
     m_config = ConfigStore::Load(*m_paths);
     if (m_folderEdit && !m_config.downloadDir.empty()) {
         SetWindowTextW(m_folderEdit, m_config.downloadDir.wstring().c_str());
     }
 
     m_ffmpeg = FfmpegManager::Resolve(*m_paths, m_config);
-    m_downloadQueue = std::make_unique<DownloadQueue>(m_config.maxParallelDownloads);
-    m_downloadQueue->SetExecutor([this](const DownloadTaskSnapshot& task, const DownloadTaskCallbacks& callbacks) {
+    m_downloadQueue = std::make_unique<DownloadQueue>(m_config.maxParallelDownloads, m_logger.get());
+    m_downloadQueue->SetExecutor([this](
+        const DownloadTaskSnapshot& task,
+        std::stop_token stopToken,
+        const DownloadTaskCallbacks& callbacks
+    ) {
         ProcessRunOptions options;
         options.executable = task.request.ytDlpExePath;
         options.arguments = BuildDownloadArguments(task.request);
@@ -1888,16 +2445,9 @@ void Application::InitializeBackend() {
             SnapshotOutputDirectory(task.request.outputDirectory);
 
         HANDLE cancelEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        std::atomic<bool> monitorDone = false;
-        std::thread cancelMonitor([&]() {
-            while (!monitorDone.load()) {
-                if (callbacks.isCanceled && callbacks.isCanceled()) {
-                    SetEvent(cancelEvent);
-                    break;
-                }
-                Sleep(50);
-            }
-        });
+        if (!cancelEvent) {
+            return DownloadTaskResult{false, L"Не удалось создать событие отмены", outputFiles};
+        }
         options.cancelEvent = cancelEvent;
         auto handleYtDlpLine = [&outputFiles, callbacks](const std::wstring& line) {
             if (callbacks.onOutputLine) {
@@ -1912,54 +2462,114 @@ void Application::InitializeBackend() {
         options.onStdoutLine = handleYtDlpLine;
         options.onStderrLine = handleYtDlpLine;
 
-        auto finish = [&](DownloadTaskResult taskResult) {
-            monitorDone = true;
-            SetEvent(cancelEvent);
-            if (cancelMonitor.joinable()) {
-                cancelMonitor.join();
-            }
-            CloseHandle(cancelEvent);
-            return taskResult;
-        };
-
-        ProcessRunResult result;
+        DownloadTaskResult taskResult;
         try {
-            result = ProcessRunner::Run(options);
+            std::stop_callback stopCallback(stopToken, [cancelEvent]() {
+                SetEvent(cancelEvent);
+            });
+            const ProcessRunResult result = ProcessRunner::Run(options);
+            if (result.canceled || stopToken.stop_requested()) {
+                taskResult = DownloadTaskResult{false, L"Отменено", outputFiles};
+            } else if (result.exitCode != 0) {
+                taskResult = DownloadTaskResult{
+                    false,
+                    result.stderrText.empty() ? result.stdoutText : result.stderrText,
+                    outputFiles
+                };
+            } else if (!task.request.transcribeAfterDownload) {
+                AddUniqueOutputPath(
+                    outputFiles,
+                    FindDownloadedMediaFile(outputFiles, task.request.outputDirectory, outputDirectoryBefore)
+                );
+                taskResult = DownloadTaskResult{true, L"", outputFiles};
+            } else {
+                const std::filesystem::path mediaPath =
+                    FindDownloadedMediaFile(outputFiles, task.request.outputDirectory, outputDirectoryBefore);
+                if (mediaPath.empty()) {
+                    taskResult = DownloadTaskResult{
+                        true,
+                        L"",
+                        outputFiles,
+                        L"Готово · файл для расшифровки не найден"
+                    };
+                } else {
+                    taskResult = TranscribeDownloadedMedia(task, callbacks, mediaPath, outputFiles, cancelEvent);
+                }
+            }
         } catch (const std::exception& ex) {
-            return finish(DownloadTaskResult{false, std::wstring(ex.what(), ex.what() + std::strlen(ex.what())), outputFiles});
+            taskResult = DownloadTaskResult{
+                false,
+                std::wstring(ex.what(), ex.what() + std::strlen(ex.what())),
+                outputFiles
+            };
+        } catch (...) {
+            taskResult = DownloadTaskResult{false, L"Неизвестная ошибка", outputFiles};
         }
-
-        if (result.canceled) {
-            return finish(DownloadTaskResult{false, L"Отменено", outputFiles});
-        }
-        if (result.exitCode != 0) {
-            return finish(DownloadTaskResult{false, result.stderrText.empty() ? result.stdoutText : result.stderrText, outputFiles});
-        }
-
-        if (callbacks.isCanceled && callbacks.isCanceled()) {
-            return finish(DownloadTaskResult{false, L"Отменено", outputFiles});
-        }
-
-        if (!task.request.transcribeAfterDownload) {
-            AddUniqueOutputPath(
-                outputFiles,
-                FindDownloadedMediaFile(outputFiles, task.request.outputDirectory, outputDirectoryBefore)
-            );
-            return finish(DownloadTaskResult{true, L"", outputFiles});
-        }
-
-        const std::filesystem::path mediaPath =
-            FindDownloadedMediaFile(outputFiles, task.request.outputDirectory, outputDirectoryBefore);
-        if (mediaPath.empty()) {
-            return finish(DownloadTaskResult{true, L"", outputFiles, L"Готово · файл для расшифровки не найден"});
-        }
-
-        return finish(TranscribeDownloadedMedia(task, callbacks, mediaPath, outputFiles, cancelEvent));
+        CloseHandle(cancelEvent);
+        return taskResult;
     });
+    LoadDownloadQueue();
 
     SetTimer(m_window, kQueueRefreshTimer, 500, nullptr);
     SetStatus(L"Проверка yt-dlp...");
     StartToolCheck();
+}
+
+void Application::LoadDownloadQueue() {
+    if (!m_paths || !m_downloadQueue) {
+        return;
+    }
+
+    try {
+        const std::vector<DownloadTaskSnapshot> tasks = DownloadQueueStore::Load(*m_paths);
+        if (tasks.empty()) {
+            return;
+        }
+        m_downloadQueue->ImportSnapshots(tasks);
+        m_lastSavedQueueRevision = m_downloadQueue->Revision();
+        if (m_logger) {
+            m_logger->Info(L"Download queue restored: count=" + std::to_wstring(tasks.size()));
+        }
+    } catch (const std::exception& ex) {
+        if (m_logger) {
+            m_logger->Error(
+                L"Download queue restore failed: " +
+                std::wstring(ex.what(), ex.what() + std::strlen(ex.what()))
+            );
+        }
+    } catch (...) {
+        if (m_logger) {
+            m_logger->Error(L"Download queue restore failed: unknown error");
+        }
+    }
+}
+
+void Application::SaveDownloadQueue(bool forShutdown) {
+    if (!m_paths || !m_downloadQueue) {
+        return;
+    }
+
+    try {
+        const std::vector<DownloadTaskSnapshot> tasks = forShutdown
+            ? m_downloadQueue->ExportSnapshotsForShutdown()
+            : m_downloadQueue->ExportSnapshots();
+        DownloadQueueStore::Save(*m_paths, tasks);
+        m_lastSavedQueueRevision = m_downloadQueue->Revision();
+        if (forShutdown && m_logger) {
+            m_logger->Info(L"Download queue saved for shutdown: count=" + std::to_wstring(tasks.size()));
+        }
+    } catch (const std::exception& ex) {
+        if (m_logger) {
+            m_logger->Error(
+                L"Download queue save failed: " +
+                std::wstring(ex.what(), ex.what() + std::strlen(ex.what()))
+            );
+        }
+    } catch (...) {
+        if (m_logger) {
+            m_logger->Error(L"Download queue save failed: unknown error");
+        }
+    }
 }
 
 void Application::StartToolCheck() {
@@ -1967,38 +2577,55 @@ void Application::StartToolCheck() {
         return;
     }
 
+    StopAndJoin(m_toolCheckWorker);
+    if (m_logger) {
+        m_logger->Info(L"yt-dlp tool check started");
+    }
     const AppPaths paths = *m_paths;
     HWND window = m_window;
-    std::thread([paths, window]() {
-        auto* result = new ToolCheckResult{};
+    m_toolCheckWorker = std::jthread([this, paths, window](std::stop_token stopToken) {
+        ToolCheckResult result;
+        UniqueHandle cancelEvent(CreateEventW(nullptr, TRUE, FALSE, nullptr));
         try {
+            if (!cancelEvent.get()) {
+                throw std::runtime_error("failed to create tool check cancellation event");
+            }
+            std::stop_callback stopCallback(stopToken, [handle = cancelEvent.get()]() {
+                SetEvent(handle);
+            });
             YtDlpManager manager(paths);
-            result->status = manager.Status();
+            result.status = manager.Status();
             try {
-                result->latestRelease = manager.CheckLatestRelease();
-                result->latestCheckAt = CurrentUtcTimestamp();
-                if (ShouldInstallYtDlpUpdate(result->status, result->latestRelease)) {
-                    result->message = result->status.installed ? L"Обновление yt-dlp..." : L"Установка yt-dlp...";
-                    result->status = manager.InstallOrUpdate();
+                result.latestRelease = manager.CheckLatestRelease(cancelEvent.get());
+                result.latestCheckAt = CurrentUtcTimestamp();
+                if (ShouldInstallYtDlpUpdate(result.status, result.latestRelease)) {
+                    result.status = manager.InstallOrUpdate(result.latestRelease, cancelEvent.get());
                 }
             } catch (...) {
-                if (!result->status.installed) {
+                if (!result.status.installed) {
                     throw;
                 }
             }
-            result->ready = result->status.installed;
-            result->message = result->ready
-                ? L"yt-dlp готов" + (result->status.version.empty() ? L"" : L" (" + result->status.version + L")")
+            result.ready = result.status.installed;
+            result.message = result.ready
+                ? L"yt-dlp готов" + (result.status.version.empty() ? L"" : L" (" + result.status.version + L")")
                 : L"yt-dlp не найден";
         } catch (const std::exception& ex) {
-            result->ready = false;
-            result->message = L"Ошибка подготовки yt-dlp: " + std::wstring(ex.what(), ex.what() + std::strlen(ex.what()));
+            result.ready = false;
+            result.message = L"Ошибка подготовки yt-dlp: " + std::wstring(ex.what(), ex.what() + std::strlen(ex.what()));
         } catch (...) {
-            result->ready = false;
-            result->message = L"Ошибка подготовки yt-dlp";
+            result.ready = false;
+            result.message = L"Ошибка подготовки yt-dlp";
         }
-        PostMessageW(window, kMsgToolCheckComplete, 0, reinterpret_cast<LPARAM>(result));
-    }).detach();
+        if (stopToken.stop_requested()) {
+            return;
+        }
+        {
+            std::lock_guard lock(m_asyncResultMutex);
+            m_toolCheckResult = std::move(result);
+        }
+        PostMessageW(window, kMsgToolCheckComplete, 0, 0);
+    });
 }
 
 void Application::StartAppUpdateCheck() {
@@ -2006,25 +2633,48 @@ void Application::StartAppUpdateCheck() {
         return;
     }
 
+    StopAndJoin(m_appUpdateWorker);
+    if (m_logger) {
+        m_logger->Info(L"Application update check started");
+    }
     HWND window = m_window;
-    std::thread([window]() {
-        auto* result = new AppUpdateCheckResult{};
+    m_appUpdateWorker = std::jthread([this, window](std::stop_token stopToken) {
+        AppUpdateCheckResult result;
+        UniqueHandle cancelEvent(CreateEventW(nullptr, TRUE, FALSE, nullptr));
         try {
-            result->release = AppUpdateService::CheckLatestRelease();
-            result->ok = true;
+            if (!cancelEvent.get()) {
+                throw std::runtime_error("failed to create app update cancellation event");
+            }
+            std::stop_callback stopCallback(stopToken, [handle = cancelEvent.get()]() {
+                SetEvent(handle);
+            });
+            result.release = AppUpdateService::CheckLatestRelease(cancelEvent.get());
+            result.ok = true;
         } catch (const std::exception& ex) {
-            result->ok = false;
-            result->error = std::wstring(ex.what(), ex.what() + std::strlen(ex.what()));
+            result.ok = false;
+            result.error = std::wstring(ex.what(), ex.what() + std::strlen(ex.what()));
         } catch (...) {
-            result->ok = false;
-            result->error = L"Неизвестная ошибка проверки обновлений";
+            result.ok = false;
+            result.error = L"Неизвестная ошибка проверки обновлений";
         }
-        PostMessageW(window, kMsgAppUpdateCheckComplete, 0, reinterpret_cast<LPARAM>(result));
-    }).detach();
+        if (stopToken.stop_requested()) {
+            return;
+        }
+        {
+            std::lock_guard lock(m_asyncResultMutex);
+            m_appUpdateCheckResult = std::move(result);
+        }
+        PostMessageW(window, kMsgAppUpdateCheckComplete, 0, 0);
+    });
 }
 
 void Application::StartPreviewFetch() {
-    if (!m_ytDlpReady || !m_ytDlpClient || !m_paths) {
+    StopAndJoin(m_previewWorker);
+    {
+        std::lock_guard lock(m_asyncResultMutex);
+        m_previewFetchResult.reset();
+    }
+    if (!m_ytDlpReady || !m_paths) {
         return;
     }
 
@@ -2045,38 +2695,66 @@ void Application::StartPreviewFetch() {
 
     const unsigned long requestId = ++m_previewRequestId;
     StartPreviewLoadingText();
+    if (m_logger) {
+        m_logger->Info(L"Preview scheduled: url=" + url);
+    }
     const YtDlpClientOptions options{m_ytDlpStatus.executable, m_paths->thumbCacheDir(), m_config.cookiesPath};
     HWND window = m_window;
-    std::thread([requestId, url, options, window]() {
-        auto* result = new PreviewFetchResult{};
-        result->requestId = requestId;
-        result->url = url;
-        try {
-            YtDlpClient client(options);
-            result->preview = client.FetchPreview(url);
-            if (!result->preview.thumbnailUrl.empty()) {
-                result->preview.cachedThumbnailPath = client.CacheThumbnail(result->preview);
-            }
-            result->ok = true;
-        } catch (const std::exception& ex) {
-            result->ok = false;
-            result->error = L"Preview недоступен: " + std::wstring(ex.what(), ex.what() + std::strlen(ex.what()));
-        } catch (...) {
-            result->ok = false;
-            result->error = L"Preview недоступен";
+    m_previewWorker = std::jthread([this, requestId, url, options, window](std::stop_token stopToken) {
+        if (!WaitForDelay(stopToken, std::chrono::milliseconds(300))) {
+            return;
         }
-        PostMessageW(window, kMsgPreviewComplete, 0, reinterpret_cast<LPARAM>(result));
-    }).detach();
+
+        PreviewFetchResult result;
+        result.requestId = requestId;
+        result.url = url;
+        UniqueHandle cancelEvent(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+        try {
+            if (!cancelEvent.get()) {
+                throw std::runtime_error("failed to create preview cancellation event");
+            }
+            std::stop_callback stopCallback(stopToken, [handle = cancelEvent.get()]() {
+                SetEvent(handle);
+            });
+            YtDlpClient client(options);
+            result.preview = client.FetchPreview(url, cancelEvent.get());
+            CachePreviewThumbnailTree(client, result.preview, cancelEvent.get());
+            result.ok = true;
+        } catch (const std::exception& ex) {
+            result.ok = false;
+            result.error = L"Preview недоступен: " + std::wstring(ex.what(), ex.what() + std::strlen(ex.what()));
+        } catch (...) {
+            result.ok = false;
+            result.error = L"Preview недоступен";
+        }
+        if (stopToken.stop_requested()) {
+            return;
+        }
+        {
+            std::lock_guard lock(m_asyncResultMutex);
+            m_previewFetchResult = std::move(result);
+        }
+        PostMessageW(window, kMsgPreviewComplete, 0, 0);
+    });
 }
 
 void Application::EnqueueCurrentUrl() {
-    const DownloadAttemptAction action = ResolveDownloadAttempt(m_ytDlpReady);
+    const DownloadAttemptAction action = ResolveDownloadAttempt(m_ytDlpReady, m_previewLoading);
     if (action == DownloadAttemptAction::ShowYtDlpNotReady || !m_downloadQueue) {
         ShowErrorDialog(
             m_window,
             m_instance,
             L"yt-dlp ещё не готов",
             L"Дождитесь завершения проверки, установки или обновления yt-dlp."
+        );
+        return;
+    }
+    if (action == DownloadAttemptAction::ShowPreviewLoading) {
+        ShowInfoDialog(
+            m_window,
+            m_instance,
+            L"Информация ещё загружается",
+            L"Дождитесь, пока приложение получит название, состав плейлиста и превью."
         );
         return;
     }
@@ -2143,6 +2821,9 @@ void Application::RefreshQueueText() {
     const std::uint64_t revision = m_downloadQueue->Revision();
     if (revision == m_lastRenderedQueueRevision) {
         return;
+    }
+    if (revision != m_lastSavedQueueRevision) {
+        SaveDownloadQueue(false);
     }
     m_lastRenderedQueueRevision = revision;
     RECT client = {};

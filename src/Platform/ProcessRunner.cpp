@@ -90,48 +90,56 @@ std::wstring BuildCommandLine(const ProcessRunOptions& options) {
     return command;
 }
 
-void EmitLines(const std::wstring& text, size_t& offset, const std::function<void(const std::wstring&)>& callback) {
+std::wstring DecodeProcessBytes(const std::string& bytes) {
+    try {
+        return Utf8ToWide(bytes);
+    } catch (...) {
+        return std::wstring(bytes.begin(), bytes.end());
+    }
+}
+
+void EmitLines(
+    const std::string& bytes,
+    size_t& offset,
+    const std::function<void(const std::wstring&)>& callback,
+    bool flushFinalLine
+) {
     if (!callback) {
         return;
     }
-    size_t start = offset;
+
     while (true) {
-        const size_t newline = text.find(L'\n', start);
-        if (newline == std::wstring::npos) {
+        const size_t newline = bytes.find('\n', offset);
+        if (newline == std::string::npos) {
             break;
         }
-        std::wstring line = text.substr(offset, newline - offset);
-        if (!line.empty() && line.back() == L'\r') {
-            line.pop_back();
+
+        std::string lineBytes = bytes.substr(offset, newline - offset);
+        if (!lineBytes.empty() && lineBytes.back() == '\r') {
+            lineBytes.pop_back();
         }
-        callback(line);
-        start = newline + 1;
-        offset = start;
+        callback(DecodeProcessBytes(lineBytes));
+        offset = newline + 1;
+    }
+
+    if (flushFinalLine && offset < bytes.size()) {
+        callback(DecodeProcessBytes(bytes.substr(offset)));
+        offset = bytes.size();
     }
 }
 
 std::thread StartReader(HANDLE readHandle, std::wstring& target, const std::function<void(const std::wstring&)>& callback) {
     return std::thread([readHandle, &target, callback]() {
         std::string bytes;
+        size_t emittedOffset = 0;
         std::array<char, 4096> buffer = {};
         DWORD read = 0;
         while (ReadFile(readHandle, buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr) && read > 0) {
             bytes.append(buffer.data(), buffer.data() + read);
-            try {
-                target = Utf8ToWide(bytes);
-            } catch (...) {
-                target.assign(bytes.begin(), bytes.end());
-            }
-            size_t offset = 0;
-            EmitLines(target, offset, callback);
+            EmitLines(bytes, emittedOffset, callback, false);
         }
-        try {
-            target = Utf8ToWide(bytes);
-        } catch (...) {
-            target.assign(bytes.begin(), bytes.end());
-        }
-        size_t offset = 0;
-        EmitLines(target + L"\n", offset, callback);
+        target = DecodeProcessBytes(bytes);
+        EmitLines(bytes, emittedOffset, callback, true);
     });
 }
 
@@ -149,6 +157,26 @@ bool CreatePipePair(UniqueHandle& readPipe, UniqueHandle& writePipe) {
     writePipe.reset(writeHandle);
     SetHandleInformation(readPipe.get(), HANDLE_FLAG_INHERIT, 0);
     return true;
+}
+
+UniqueHandle CreateKillOnCloseJob() {
+    UniqueHandle job(CreateJobObjectW(nullptr, nullptr));
+    if (!job.get()) {
+        throw std::runtime_error("failed to create process job object");
+    }
+
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!SetInformationJobObject(
+            job.get(),
+            JobObjectExtendedLimitInformation,
+            &limits,
+            static_cast<DWORD>(sizeof(limits))
+        )) {
+        throw std::runtime_error("failed to configure process job object");
+    }
+
+    return job;
 }
 
 } // namespace
@@ -177,6 +205,7 @@ ProcessRunResult ProcessRunner::Run(const ProcessRunOptions& options) {
     PROCESS_INFORMATION process = {};
     std::wstring commandLine = BuildCommandLine(options);
     std::wstring workingDirectory = options.workingDirectory.empty() ? L"" : options.workingDirectory.wstring();
+    UniqueHandle job = CreateKillOnCloseJob();
 
     const BOOL created = CreateProcessW(
         nullptr,
@@ -184,7 +213,7 @@ ProcessRunResult ProcessRunner::Run(const ProcessRunOptions& options) {
         nullptr,
         nullptr,
         TRUE,
-        CREATE_NO_WINDOW,
+        CREATE_NO_WINDOW | CREATE_SUSPENDED,
         nullptr,
         workingDirectory.empty() ? nullptr : workingDirectory.c_str(),
         &startup,
@@ -200,6 +229,16 @@ ProcessRunResult ProcessRunner::Run(const ProcessRunOptions& options) {
 
     UniqueHandle processHandle(process.hProcess);
     UniqueHandle threadHandle(process.hThread);
+    if (!AssignProcessToJobObject(job.get(), processHandle.get())) {
+        TerminateProcess(processHandle.get(), 1);
+        WaitForSingleObject(processHandle.get(), INFINITE);
+        throw std::runtime_error("failed to assign process to job object");
+    }
+    if (ResumeThread(threadHandle.get()) == static_cast<DWORD>(-1)) {
+        TerminateJobObject(job.get(), 1);
+        WaitForSingleObject(processHandle.get(), INFINITE);
+        throw std::runtime_error("failed to resume process thread");
+    }
 
     ProcessRunResult result;
     std::thread stdoutThread = StartReader(stdoutRead.get(), result.stdoutText, options.onStdoutLine);
@@ -214,7 +253,7 @@ ProcessRunResult ProcessRunner::Run(const ProcessRunOptions& options) {
 
         if (options.cancelEvent && WaitForSingleObject(options.cancelEvent, 0) == WAIT_OBJECT_0) {
             result.canceled = true;
-            TerminateProcess(processHandle.get(), 1);
+            TerminateJobObject(job.get(), 1);
             break;
         }
 
@@ -224,7 +263,7 @@ ProcessRunResult ProcessRunner::Run(const ProcessRunOptions& options) {
             ).count();
             if (elapsed >= options.timeoutMs) {
                 result.timedOut = true;
-                TerminateProcess(processHandle.get(), 1);
+                TerminateJobObject(job.get(), 1);
                 break;
             }
         }

@@ -9,9 +9,12 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <thread>
 #include <vector>
+
+class Logger;
 
 enum class DownloadTaskState {
     Queued,
@@ -31,7 +34,6 @@ struct DownloadTaskSnapshot {
     DownloadTaskState state = DownloadTaskState::Queued;
     double percent = 0.0;
     std::wstring statusText;
-    std::wstring lastOutputLine;
     std::wstring errorText;
     std::uint64_t downloadedBytes = 0;
     std::uint64_t totalBytes = 0;
@@ -45,11 +47,9 @@ struct DownloadTaskSnapshot {
 };
 
 struct DownloadTaskCallbacks {
-    std::function<void(double percent, const std::wstring& status)> onProgress;
     std::function<void(const YtDlpProgress& progress)> onProgressDetails;
     std::function<void(double percent, const std::wstring& status)> onPostProcessing;
     std::function<void(const std::wstring& line)> onOutputLine;
-    std::function<bool()> isCanceled;
 };
 
 struct DownloadTaskResult {
@@ -61,18 +61,20 @@ struct DownloadTaskResult {
 
 using DownloadTaskExecutor = std::function<DownloadTaskResult(
     const DownloadTaskSnapshot& task,
+    std::stop_token stopToken,
     const DownloadTaskCallbacks& callbacks
 )>;
 
 class DownloadQueue {
 public:
-    explicit DownloadQueue(int maxParallelDownloads);
+    explicit DownloadQueue(int maxParallelDownloads, Logger* logger = nullptr);
     ~DownloadQueue();
 
     DownloadQueue(const DownloadQueue&) = delete;
     DownloadQueue& operator=(const DownloadQueue&) = delete;
 
     void SetExecutor(DownloadTaskExecutor executor);
+    void SetMaxParallelDownloads(int maxParallelDownloads);
     int Enqueue(const YtDlpDownloadRequest& request, std::wstring title, std::filesystem::path thumbnailPath = {});
     bool EnrichMetadata(const std::wstring& url, std::wstring title, std::filesystem::path thumbnailPath = {});
     bool Cancel(int id);
@@ -84,6 +86,9 @@ public:
 
     DownloadTaskSnapshot GetTask(int id) const;
     std::vector<DownloadTaskSnapshot> Snapshot() const;
+    void ImportSnapshots(const std::vector<DownloadTaskSnapshot>& tasks);
+    std::vector<DownloadTaskSnapshot> ExportSnapshots() const;
+    std::vector<DownloadTaskSnapshot> ExportSnapshotsForShutdown() const;
     std::uint64_t Revision() const;
     void WaitForIdle();
     void Shutdown();
@@ -97,9 +102,16 @@ private:
     };
 
     void SchedulerLoop();
-    void StartTask(int id);
-    void RunTask(int id, DownloadTaskExecutor executor);
-    DownloadTaskResult DefaultExecutor(const DownloadTaskSnapshot& task, const DownloadTaskCallbacks& callbacks);
+    void StartTask(int id, std::stop_token stopToken);
+    void RunTask(int id, DownloadTaskExecutor executor, std::stop_token stopToken);
+    void UpdateTaskProgress(int id, const YtDlpProgress& progress);
+    void RecordTaskOutput(int id, const std::wstring& line);
+    void FinishTask(int id, std::stop_token stopToken, const DownloadTaskResult& result);
+    DownloadTaskResult DefaultExecutor(
+        const DownloadTaskSnapshot& task,
+        std::stop_token stopToken,
+        const DownloadTaskCallbacks& callbacks
+    );
 
     int m_maxParallelDownloads = 1;
     int m_nextId = 1;
@@ -109,6 +121,9 @@ private:
     mutable std::mutex m_mutex;
     std::condition_variable m_cv;
     std::map<int, TaskRecord> m_tasks;
-    std::thread m_scheduler;
+    std::map<int, std::jthread> m_workers;
+    std::vector<int> m_finishedWorkerIds;
     DownloadTaskExecutor m_executor;
+    Logger* m_logger = nullptr;
+    std::jthread m_scheduler;
 };

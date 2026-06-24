@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <sstream>
 #include <stdexcept>
+#include <vector>
 
 std::string WideToUtf8(const std::wstring& value) {
     if (value.empty()) {
@@ -120,6 +121,54 @@ std::wstring FormatProgressBytes(std::uint64_t downloaded, std::uint64_t total) 
         return downloadedText + L" / " + FormatBytes(total);
     }
     return FormatBytes(downloaded);
+}
+
+std::wstring FormatDuration(std::uint64_t seconds) {
+    if (seconds == 0) {
+        return {};
+    }
+
+    constexpr std::uint64_t kMinute = 60;
+    constexpr std::uint64_t kHour = 60 * kMinute;
+    constexpr std::uint64_t kDay = 24 * kHour;
+
+    const std::uint64_t days = seconds / kDay;
+    seconds %= kDay;
+    const std::uint64_t hours = seconds / kHour;
+    seconds %= kHour;
+    const std::uint64_t minutes = seconds / kMinute;
+    seconds %= kMinute;
+
+    std::vector<std::wstring> parts;
+    if (days > 0) {
+        parts.push_back(std::to_wstring(days) + L" д");
+        if (hours > 0) {
+            parts.push_back(std::to_wstring(hours) + L" ч");
+        } else if (minutes > 0) {
+            parts.push_back(std::to_wstring(minutes) + L" мин");
+        }
+    } else if (hours > 0) {
+        parts.push_back(std::to_wstring(hours) + L" ч");
+        if (minutes > 0) {
+            parts.push_back(std::to_wstring(minutes) + L" мин");
+        }
+    } else if (minutes > 0) {
+        parts.push_back(std::to_wstring(minutes) + L" мин");
+        if (seconds > 0) {
+            parts.push_back(std::to_wstring(seconds) + L" с");
+        }
+    } else {
+        parts.push_back(std::to_wstring(seconds) + L" с");
+    }
+
+    std::wstring result;
+    for (const std::wstring& part : parts) {
+        if (!result.empty()) {
+            result += L" ";
+        }
+        result += part;
+    }
+    return result;
 }
 
 int CalculateProgressPercent(std::uint64_t downloaded, std::uint64_t total) {

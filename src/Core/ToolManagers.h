@@ -18,7 +18,6 @@
 struct ReleaseAssetInfo {
     bool found = false;
     std::wstring version;
-    std::wstring pageUrl;
     std::wstring downloadUrl;
 };
 
@@ -35,8 +34,6 @@ struct FfmpegStatus {
     bool available = false;
     FfmpegSource source = FfmpegSource::Missing;
     std::filesystem::path ffmpegExe;
-    std::filesystem::path ffprobeExe;
-    std::filesystem::path binDir;
     std::wstring message;
 };
 
@@ -73,6 +70,7 @@ struct WhisperModelInfo {
 };
 
 bool ShouldInstallYtDlpUpdate(const ToolInstallStatus& current, const ReleaseAssetInfo& latest);
+bool ValidateYtDlpExecutableVersion(const std::filesystem::path& executable, const std::wstring& expectedVersion);
 bool ShouldInstallAppUpdate(const ReleaseAssetInfo& latest);
 std::wstring BuildAppUpdatePromptMessage(const ReleaseAssetInfo& release);
 
@@ -114,8 +112,9 @@ public:
     explicit YtDlpManager(AppPaths paths);
 
     ToolInstallStatus Status() const;
-    ReleaseAssetInfo CheckLatestRelease() const;
+    ReleaseAssetInfo CheckLatestRelease(HANDLE cancelEvent = nullptr) const;
     ToolInstallStatus InstallOrUpdate(HANDLE cancelEvent = nullptr) const;
+    ToolInstallStatus InstallOrUpdate(const ReleaseAssetInfo& release, HANDLE cancelEvent = nullptr) const;
 
 private:
     AppPaths m_paths;
@@ -123,7 +122,7 @@ private:
 
 class AppUpdateService {
 public:
-    static ReleaseAssetInfo CheckLatestRelease();
+    static ReleaseAssetInfo CheckLatestRelease(HANDLE cancelEvent = nullptr);
     static std::filesystem::path DownloadUpdateExe(
         const AppPaths& paths,
         const ReleaseAssetInfo& release,

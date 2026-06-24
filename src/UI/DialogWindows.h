@@ -15,11 +15,8 @@ struct ReleaseAssetInfo;
 
 void ShowInfoDialog(HWND owner, HINSTANCE instance, const std::wstring& title, const std::wstring& message);
 void ShowErrorDialog(HWND owner, HINSTANCE instance, const std::wstring& title, const std::wstring& message);
-void ShowSettingsDialog(HWND owner, HINSTANCE instance);
-bool ShowSettingsDialog(HWND owner, HINSTANCE instance, AppConfig& config);
+void ShowLogsDialog(HWND owner, HINSTANCE instance, const std::wstring& logText);
 bool ShowSettingsDialog(HWND owner, HINSTANCE instance, const AppPaths& paths, AppConfig& config);
-void ShowAboutDialog(HWND owner, HINSTANCE instance);
-void ShowFfmpegDialog(HWND owner, HINSTANCE instance);
 bool ShowFfmpegDialog(HWND owner, HINSTANCE instance, const AppPaths& paths, AppConfig& config);
 void ShowAboutDialog(HWND owner, HINSTANCE instance, const AppPaths& paths);
 bool OfferAppUpdate(HWND owner, HINSTANCE instance, const AppPaths& paths, const ReleaseAssetInfo& release, bool notifyWhenCurrent);

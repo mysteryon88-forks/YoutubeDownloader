@@ -7,3 +7,4 @@ out/
 *.VC.db
 *.VC.VC.opendb
 docs/
+.codegraph/

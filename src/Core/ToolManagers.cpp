@@ -2,12 +2,14 @@
 
 #include "AppVersion.h"
 #include "BackendText.h"
+#include "FileOperations.h"
 #include "ProcessRunner.h"
 #include "Version.h"
 #include "WinHttpClient.h"
 
 #include <nlohmann/json.hpp>
 
+#include <cwctype>
 #include <fstream>
 #include <iterator>
 #include <sstream>
@@ -41,17 +43,11 @@ bool IsExecutableFile(const std::filesystem::path& path) {
     return !path.empty() && std::filesystem::is_regular_file(path, ec);
 }
 
-std::filesystem::path SiblingExe(const std::filesystem::path& ffmpegExe, const wchar_t* name) {
-    return ffmpegExe.parent_path() / name;
-}
-
 FfmpegStatus MakeFfmpegStatus(FfmpegSource source, const std::filesystem::path& exe) {
     FfmpegStatus status;
     status.available = true;
     status.source = source;
     status.ffmpegExe = exe;
-    status.ffprobeExe = SiblingExe(exe, L"ffprobe.exe");
-    status.binDir = exe.parent_path();
     status.message = L"FFmpeg найден";
     return status;
 }
@@ -292,7 +288,6 @@ ReleaseAssetInfo ParseGitHubReleaseAsset(const std::string& releaseJson, const s
         }
 
         info.version = NormalizeVersion(AsciiToWide(json.value("tag_name", json.value("name", ""))));
-        info.pageUrl = AsciiToWide(json.value("html_url", ""));
 
         const auto assets = json.find("assets");
         if (assets == json.end() || !assets->is_array()) {
@@ -391,13 +386,11 @@ FfmpegStatus FfmpegManager::InstallEssentials(
     const std::function<void(std::uint64_t downloaded, std::uint64_t total, const std::wstring& status)>& onProgress,
     HANDLE cancelEvent
 ) {
-    const std::filesystem::path archiveTmp = paths.stuffDir() / L"ffmpeg-release-essentials.zip.tmp";
     const std::filesystem::path archive = paths.stuffDir() / L"ffmpeg-release-essentials.zip";
     const std::filesystem::path extractDir = paths.stuffDir() / L"ffmpeg_extract";
 
     std::error_code ec;
     std::filesystem::create_directories(paths.stuffDir(), ec);
-    std::filesystem::remove(archiveTmp, ec);
     std::filesystem::remove(archive, ec);
     std::filesystem::remove_all(extractDir, ec);
 
@@ -407,7 +400,7 @@ FfmpegStatus FfmpegManager::InstallEssentials(
 
     WinHttpClient::DownloadFile(
         EssentialsDownloadUrl(),
-        archiveTmp,
+        archive,
         [onProgress](std::uint64_t downloaded, std::uint64_t total) {
             if (onProgress) {
                 onProgress(downloaded, total, L"Скачивание FFmpeg...");
@@ -418,11 +411,6 @@ FfmpegStatus FfmpegManager::InstallEssentials(
 
     if (cancelEvent && WaitForSingleObject(cancelEvent, 0) == WAIT_OBJECT_0) {
         throw std::runtime_error("operation canceled");
-    }
-
-    std::filesystem::rename(archiveTmp, archive, ec);
-    if (ec) {
-        throw std::runtime_error("failed to finalize FFmpeg archive");
     }
 
     std::filesystem::create_directories(extractDir, ec);
@@ -811,6 +799,37 @@ bool ShouldInstallYtDlpUpdate(const ToolInstallStatus& current, const ReleaseAss
     return CompareVersions(current.version, latest.version) < 0;
 }
 
+bool ValidateYtDlpExecutableVersion(const std::filesystem::path& executable, const std::wstring& expectedVersion) {
+    if (!IsExecutableFile(executable)) {
+        return false;
+    }
+
+    ProcessRunOptions options;
+    options.executable = executable;
+    options.arguments = {L"--version"};
+    options.timeoutMs = 15000;
+
+    const ProcessRunResult result = ProcessRunner::Run(options);
+    if (result.canceled || result.timedOut || result.exitCode != 0) {
+        return false;
+    }
+
+    std::wstring version = result.stdoutText.empty() ? result.stderrText : result.stdoutText;
+    while (!version.empty() && iswspace(version.back())) {
+        version.pop_back();
+    }
+    while (!version.empty() && iswspace(version.front())) {
+        version.erase(version.begin());
+    }
+    if (version.empty()) {
+        return false;
+    }
+    if (expectedVersion.empty()) {
+        return true;
+    }
+    return NormalizeVersion(version) == NormalizeVersion(expectedVersion);
+}
+
 bool ShouldInstallAppUpdate(const ReleaseAssetInfo& latest) {
     return latest.found &&
            !latest.version.empty() &&
@@ -833,35 +852,48 @@ ToolInstallStatus YtDlpManager::Status() const {
     return status;
 }
 
-ReleaseAssetInfo YtDlpManager::CheckLatestRelease() const {
-    const std::string json = WinHttpClient::GetString(L"https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest");
+ReleaseAssetInfo YtDlpManager::CheckLatestRelease(HANDLE cancelEvent) const {
+    const std::string json = WinHttpClient::GetString(
+        L"https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest",
+        cancelEvent
+    );
     return ParseGitHubReleaseAsset(json, "yt-dlp.exe");
 }
 
 ToolInstallStatus YtDlpManager::InstallOrUpdate(HANDLE cancelEvent) const {
-    const ReleaseAssetInfo release = CheckLatestRelease();
+    const ReleaseAssetInfo release = CheckLatestRelease(cancelEvent);
+    return InstallOrUpdate(release, cancelEvent);
+}
+
+ToolInstallStatus YtDlpManager::InstallOrUpdate(const ReleaseAssetInfo& release, HANDLE cancelEvent) const {
     if (!release.found) {
         throw std::runtime_error("yt-dlp release asset was not found");
     }
 
-    const std::filesystem::path tmpPath = m_paths.ytDlpExePath().wstring() + L".tmp";
+    const std::filesystem::path tmpPath = m_paths.ytDlpExePath().wstring() + L".new";
     std::error_code ec;
     std::filesystem::remove(tmpPath, ec);
 
     WinHttpClient::DownloadFile(release.downloadUrl, tmpPath, {}, cancelEvent);
 
-    std::filesystem::remove(m_paths.ytDlpExePath(), ec);
-    ec.clear();
-    std::filesystem::rename(tmpPath, m_paths.ytDlpExePath(), ec);
+    const std::uint64_t downloadedSize = static_cast<std::uint64_t>(std::filesystem::file_size(tmpPath, ec));
     if (ec) {
-        throw std::runtime_error("failed to replace yt-dlp executable");
+        throw std::runtime_error("failed to inspect downloaded yt-dlp executable");
     }
+    if (!ValidateYtDlpExecutableVersion(tmpPath, release.version)) {
+        std::filesystem::remove(tmpPath, ec);
+        throw std::runtime_error("downloaded yt-dlp executable failed version validation");
+    }
+    CommitDownloadedFile(tmpPath, m_paths.ytDlpExePath(), downloadedSize, downloadedSize);
     WriteTextFile(m_paths.ytDlpVersionPath(), release.version);
     return Status();
 }
 
-ReleaseAssetInfo AppUpdateService::CheckLatestRelease() {
-    const std::string json = WinHttpClient::GetString(L"https://api.github.com/repos/Laynholt/YoutubeDownloader/releases/latest");
+ReleaseAssetInfo AppUpdateService::CheckLatestRelease(HANDLE cancelEvent) {
+    const std::string json = WinHttpClient::GetString(
+        L"https://api.github.com/repos/Laynholt/YoutubeDownloader/releases/latest",
+        cancelEvent
+    );
     return ParseGitHubReleaseAsset(json, "YoutubeDownloader.exe");
 }
 

@@ -1,6 +1,7 @@
 #include "WinHttpClient.h"
 
 #include "AppVersion.h"
+#include "FileOperations.h"
 
 #include <winhttp.h>
 
@@ -79,8 +80,13 @@ UrlParts CrackUrl(const std::wstring& url) {
     }
 
     UrlParts parts;
+    if (!components.lpszHostName || components.dwHostNameLength == 0) {
+        throw std::runtime_error("URL host is missing");
+    }
     parts.host.assign(components.lpszHostName, components.dwHostNameLength);
-    parts.path.assign(components.lpszUrlPath, components.dwUrlPathLength);
+    if (components.lpszUrlPath && components.dwUrlPathLength > 0) {
+        parts.path.assign(components.lpszUrlPath, components.dwUrlPathLength);
+    }
     if (components.lpszExtraInfo && components.dwExtraInfoLength > 0) {
         parts.path.append(components.lpszExtraInfo, components.dwExtraInfoLength);
     }
@@ -264,33 +270,60 @@ void WinHttpClient::DownloadFile(
 
     std::error_code ec;
     std::filesystem::create_directories(target.parent_path(), ec);
+    if (ec) {
+        throw std::runtime_error("failed to create download directory");
+    }
 
-    std::ofstream out(target, std::ios::binary | std::ios::trunc);
+    const std::filesystem::path staged = target.wstring() + L".download";
+    std::filesystem::remove(staged, ec);
+    ec.clear();
+
+    std::ofstream out(staged, std::ios::binary | std::ios::trunc);
     if (!out) {
         throw std::runtime_error("failed to open download target");
     }
 
-    std::array<char, 8192> buffer = {};
-    std::uint64_t downloaded = 0;
-    while (true) {
-        ThrowIfCanceled(cancelEvent);
-        DWORD available = 0;
-        if (!WinHttpQueryDataAvailable(request.get(), &available)) {
-            throw std::runtime_error("failed to query HTTP data");
-        }
-        if (available == 0) {
-            break;
+    try {
+        std::array<char, 8192> buffer = {};
+        std::uint64_t downloaded = 0;
+        while (true) {
+            ThrowIfCanceled(cancelEvent);
+            DWORD available = 0;
+            if (!WinHttpQueryDataAvailable(request.get(), &available)) {
+                throw std::runtime_error("failed to query HTTP data");
+            }
+            if (available == 0) {
+                break;
+            }
+
+            DWORD read = 0;
+            const DWORD toRead = std::min<DWORD>(available, static_cast<DWORD>(buffer.size()));
+            if (!WinHttpReadData(request.get(), buffer.data(), toRead, &read)) {
+                throw std::runtime_error("failed to read HTTP data");
+            }
+            out.write(buffer.data(), static_cast<std::streamsize>(read));
+            if (!out) {
+                throw std::runtime_error("failed to write downloaded data");
+            }
+            downloaded += read;
+            if (onProgress) {
+                onProgress(downloaded, total);
+            }
         }
 
-        DWORD read = 0;
-        const DWORD toRead = std::min<DWORD>(available, static_cast<DWORD>(buffer.size()));
-        if (!WinHttpReadData(request.get(), buffer.data(), toRead, &read)) {
-            throw std::runtime_error("failed to read HTTP data");
+        ThrowIfCanceled(cancelEvent);
+        out.flush();
+        if (!out) {
+            throw std::runtime_error("failed to flush downloaded data");
         }
-        out.write(buffer.data(), read);
-        downloaded += read;
-        if (onProgress) {
-            onProgress(downloaded, total);
+        out.close();
+        if (!out) {
+            throw std::runtime_error("failed to close downloaded data");
         }
+        CommitDownloadedFile(staged, target, downloaded, total);
+    } catch (...) {
+        out.close();
+        std::filesystem::remove(staged, ec);
+        throw;
     }
 }

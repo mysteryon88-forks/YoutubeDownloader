@@ -18,6 +18,7 @@
 #include <functional>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -36,9 +37,12 @@ namespace {
 constexpr const wchar_t* kDialogClassName = L"YoutubeDownloaderDialogWindow";
 constexpr const wchar_t* kDialogButtonClassName = L"YoutubeDownloaderDialogButton";
 constexpr const wchar_t* kScrollTextClassName = L"YoutubeDownloaderScrollText";
+constexpr const wchar_t* kLogViewClassName = L"YoutubeDownloaderLogView";
+constexpr const wchar_t* kLogCopyMenuClassName = L"YoutubeDownloaderLogCopyMenu";
 
 constexpr COLORREF kBackgroundColor = RGB(20, 20, 22);
 constexpr COLORREF kPanelColor = RGB(28, 28, 31);
+constexpr COLORREF kInputColor = RGB(25, 25, 28);
 constexpr COLORREF kTextColor = RGB(242, 242, 242);
 constexpr COLORREF kMutedTextColor = RGB(172, 172, 178);
 constexpr int kDialogPanelInset = 12;
@@ -49,6 +53,14 @@ constexpr int kScrollTextTopPadding = 12;
 constexpr int kScrollTextBottomPadding = 12;
 constexpr int kScrollTextClipTopPadding = 8;
 constexpr int kScrollTextClipBottomPadding = 8;
+constexpr int kSettingsDialogWidth = 720;
+constexpr int kSettingsDialogHeight = 720;
+constexpr int kSettingsTabWidth = 136;
+constexpr int kSettingsTabGap = 12;
+constexpr int kSettingsParallelControlWidth = 40;
+constexpr int kSettingsParallelValueWidth = 52;
+constexpr int kSettingsCancelButtonWidth = 132;
+constexpr int kSettingsSaveButtonWidth = 148;
 constexpr RECT kParallelValueRect = {458, 296, 510, 330};
 constexpr UINT kProgressUpdateMessage = WM_APP + 40;
 constexpr UINT kProgressDoneMessage = WM_APP + 41;
@@ -59,6 +71,7 @@ enum class DialogType {
     Confirmation,
     Settings,
     About,
+    Logs,
     Ffmpeg,
     Whisper,
     WhisperModels,
@@ -117,12 +130,41 @@ struct ScrollTextState {
     int dragStartScrollY = 0;
 };
 
+struct LogLineLayout {
+    RECT rect = {};
+};
+
+struct LogViewState {
+    std::wstring text;
+    std::vector<std::wstring> lines;
+    std::vector<LogLineLayout> layouts;
+    int scrollY = 0;
+    int contentHeight = 0;
+    int selectedLine = -1;
+    bool draggingThumb = false;
+    int dragStartY = 0;
+    int dragStartScrollY = 0;
+};
+
+struct LogCopyMenuState {
+    HWND owner = nullptr;
+    std::wstring text;
+    bool hot = false;
+};
+
+struct ProgressUpdate {
+    std::uint64_t downloaded = 0;
+    std::uint64_t total = 0;
+    std::wstring status;
+};
+
 struct DialogState {
     DialogType type = DialogType::Info;
     HINSTANCE instance = nullptr;
     HWND owner = nullptr;
     HWND window = nullptr;
     HWND scrollText = nullptr;
+    HWND logView = nullptr;
     std::wstring title;
     std::wstring message;
     const AppPaths* paths = nullptr;
@@ -144,12 +186,10 @@ struct DialogState {
     ReleaseAssetInfo release;
     WhisperModelInfo whisperModel;
     WhisperBackend whisperBackend = WhisperBackend::Cpu;
-};
-
-struct ProgressUpdate {
-    std::uint64_t downloaded = 0;
-    std::uint64_t total = 0;
-    std::wstring status;
+    std::jthread worker;
+    std::mutex progressMutex;
+    std::optional<ProgressUpdate> pendingProgress;
+    std::optional<std::wstring> progressError;
 };
 
 void EnableDarkTitleBar(HWND window) {
@@ -209,28 +249,6 @@ void PaintBuffered(HWND window, const std::function<void(HDC, const RECT&)>& pai
     DeleteObject(bitmap);
     DeleteDC(bufferDc);
     EndPaint(window, &paint);
-}
-
-void CopyToClipboard(HWND owner, const std::wstring& text) {
-    if (!OpenClipboard(owner)) {
-        return;
-    }
-    EmptyClipboard();
-    const SIZE_T byteCount = (text.size() + 1) * sizeof(wchar_t);
-    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, byteCount);
-    if (memory) {
-        void* target = GlobalLock(memory);
-        if (target) {
-            memcpy(target, text.c_str(), byteCount);
-            GlobalUnlock(memory);
-            SetClipboardData(CF_UNICODETEXT, memory);
-            memory = nullptr;
-        }
-    }
-    if (memory) {
-        GlobalFree(memory);
-    }
-    CloseClipboard();
 }
 
 std::optional<std::filesystem::path> PickFfmpegFolder(HWND owner) {
@@ -540,6 +558,9 @@ void RefreshWhisperDialogText(DialogState* state) {
 void RegisterDialogClasses(HINSTANCE instance);
 LRESULT CALLBACK DialogWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK DialogButtonProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
+LRESULT CALLBACK LogViewProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
+LRESULT CALLBACK LogCopyMenuProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
+HWND CreateLogView(HWND parent, HINSTANCE instance, const std::wstring& text);
 LRESULT CALLBACK ScrollTextProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
 
 HWND CreateDarkButton(HWND parent, HINSTANCE instance, const wchar_t* text, int id, bool primary) {
@@ -701,11 +722,17 @@ void RunModal(HWND owner, HWND window) {
 void ShowModal(DialogState* state, int width, int height) {
     RegisterDialogClasses(state->instance);
 
+    DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    DWORD exStyle = WS_EX_DLGMODALFRAME;
+    if (state->type == DialogType::Logs) {
+        style |= WS_THICKFRAME | WS_MAXIMIZEBOX;
+    }
+
     HWND window = CreateWindowExW(
-        WS_EX_DLGMODALFRAME,
+        exStyle,
         kDialogClassName,
         state->title.c_str(),
-        WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        style,
         0,
         0,
         width,
@@ -842,6 +869,38 @@ void LayoutWhisperModelsDialog(DialogState* state, int width, int height) {
     }
 }
 
+void LayoutLogsDialog(DialogState* state, int width, int height) {
+    const int panelRight = width - kDialogPanelInset;
+    const int panelBottom = height - kDialogPanelInset;
+    const int buttonY = panelBottom - kDialogButtonInset - kDialogButtonHeight;
+
+    HWND copyButton = GetDlgItem(state->window, IdCopy);
+    HWND okButton = GetDlgItem(state->window, IdOk);
+    if (copyButton) {
+        MoveWindow(
+            copyButton,
+            panelRight - kDialogButtonInset - 112 - kDialogButtonGap - 150,
+            buttonY,
+            150,
+            kDialogButtonHeight,
+            TRUE
+        );
+    }
+    if (okButton) {
+        MoveWindow(okButton, panelRight - kDialogButtonInset - 112, buttonY, 112, kDialogButtonHeight, TRUE);
+    }
+    if (state->logView) {
+        MoveWindow(
+            state->logView,
+            24,
+            82,
+            std::max(120, width - 48),
+            std::max(80, buttonY - 98),
+            TRUE
+        );
+    }
+}
+
 void LayoutSettingsDialog(DialogState* state, int width, int height) {
     HWND settingsTab = GetDlgItem(state->window, IdSettingsTab);
     HWND utilitiesTab = GetDlgItem(state->window, IdUtilitiesTab);
@@ -940,6 +999,9 @@ void LayoutDialog(DialogState* state, int width, int height) {
     case DialogType::Confirmation:
     case DialogType::About:
         LayoutMessageDialog(state, width, height);
+        break;
+    case DialogType::Logs:
+        LayoutLogsDialog(state, width, height);
         break;
     case DialogType::Ffmpeg:
         LayoutFfmpegDialog(state, width, height);
@@ -1100,6 +1162,29 @@ bool ShouldRepaintProgress(DialogState* state, const ProgressUpdate& update) {
     state->lastProgressPaintPercent = percent;
     state->lastProgressPaintStatus = update.status;
     return true;
+}
+
+void DrawLogsDialog(DialogState* state, HDC dc, const RECT& client) {
+    UNREFERENCED_PARAMETER(state);
+    DrawDialogBackground(dc, client);
+
+    HFONT titleFont = CreateUiFont(-18, FW_SEMIBOLD);
+    HFONT textFont = CreateUiFont(-14, FW_NORMAL);
+
+    RECT titleRect = {24, 28, client.right - 24, 58};
+    DrawTextBlock(dc, L"Логи", titleRect, kTextColor, titleFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    RECT subtitleRect = {24, 56, client.right - 24, 78};
+    DrawTextBlock(
+        dc,
+        L"Выделите нужные строки или скопируйте весь текущий лог.",
+        subtitleRect,
+        kMutedTextColor,
+        textFont,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS
+    );
+
+    DeleteObject(titleFont);
+    DeleteObject(textFont);
 }
 
 void DrawSettingsDialog(DialogState* state, HDC dc, const RECT& client) {
@@ -1276,6 +1361,14 @@ void CreateMessageControls(DialogState* state) {
     AddDialogTooltip(state, okButton, L"Закрывает окно.");
 }
 
+void CreateLogsControls(DialogState* state) {
+    state->logView = CreateLogView(state->window, state->instance, state->message);
+    HWND copyButton = CreateDarkButton(state->window, state->instance, L"Скопировать всё", IdCopy, false);
+    HWND okButton = CreateDarkButton(state->window, state->instance, L"Закрыть", IdOk, true);
+    AddDialogTooltip(state, copyButton, L"Копирует весь текущий лог в буфер обмена.");
+    AddDialogTooltip(state, okButton, L"Закрывает окно логов.");
+}
+
 void CreateFfmpegControls(DialogState* state) {
     HWND installButton = CreateDarkButton(state->window, state->instance, L"Установить", IdInstall, true);
     HWND folderButton = CreateDarkButton(state->window, state->instance, L"Выбрать папку", IdChooseFolder, false);
@@ -1325,29 +1418,35 @@ void StartFfmpegInstallWorker(DialogState* state) {
     AppConfig* config = state->config;
     HANDLE cancelEvent = state->cancelEvent;
 
-    std::thread([window, paths, config, cancelEvent]() {
+    state->worker = std::jthread([state, window, paths, config, cancelEvent](std::stop_token) {
         try {
             const FfmpegStatus status = FfmpegManager::InstallEssentials(
                 paths,
-                [window](std::uint64_t downloaded, std::uint64_t total, const std::wstring& statusText) {
-                    auto* update = new ProgressUpdate{};
-                    update->downloaded = downloaded;
-                    update->total = total;
-                    update->status = statusText;
-                    PostMessageW(window, kProgressUpdateMessage, 0, reinterpret_cast<LPARAM>(update));
+                [state, window](std::uint64_t downloaded, std::uint64_t total, const std::wstring& statusText) {
+                    {
+                        std::lock_guard lock(state->progressMutex);
+                        state->pendingProgress = ProgressUpdate{downloaded, total, statusText};
+                    }
+                    PostMessageW(window, kProgressUpdateMessage, 0, 0);
                 },
                 cancelEvent
             );
             config->ffmpegPath = status.ffmpegExe;
             PostMessageW(window, kProgressDoneMessage, TRUE, 0);
         } catch (const std::exception& ex) {
-            auto* error = new std::wstring(ex.what(), ex.what() + std::strlen(ex.what()));
-            PostMessageW(window, kProgressDoneMessage, FALSE, reinterpret_cast<LPARAM>(error));
+            {
+                std::lock_guard lock(state->progressMutex);
+                state->progressError = std::wstring(ex.what(), ex.what() + std::strlen(ex.what()));
+            }
+            PostMessageW(window, kProgressDoneMessage, FALSE, 0);
         } catch (...) {
-            auto* error = new std::wstring(L"Неизвестная ошибка установки FFmpeg");
-            PostMessageW(window, kProgressDoneMessage, FALSE, reinterpret_cast<LPARAM>(error));
+            {
+                std::lock_guard lock(state->progressMutex);
+                state->progressError = L"Неизвестная ошибка установки FFmpeg";
+            }
+            PostMessageW(window, kProgressDoneMessage, FALSE, 0);
         }
-    }).detach();
+    });
 }
 
 void StartWhisperInstallWorker(DialogState* state) {
@@ -1361,17 +1460,17 @@ void StartWhisperInstallWorker(DialogState* state) {
     HANDLE cancelEvent = state->cancelEvent;
     const WhisperBackend backend = state->whisperBackend;
 
-    std::thread([window, paths, config, cancelEvent, backend]() {
+    state->worker = std::jthread([state, window, paths, config, cancelEvent, backend](std::stop_token) {
         try {
             const ToolInstallStatus status = WhisperManager::Install(
                 paths,
                 backend,
-                [window](std::uint64_t downloaded, std::uint64_t total, const std::wstring& statusText) {
-                    auto* update = new ProgressUpdate{};
-                    update->downloaded = downloaded;
-                    update->total = total;
-                    update->status = statusText;
-                    PostMessageW(window, kProgressUpdateMessage, 0, reinterpret_cast<LPARAM>(update));
+                [state, window](std::uint64_t downloaded, std::uint64_t total, const std::wstring& statusText) {
+                    {
+                        std::lock_guard lock(state->progressMutex);
+                        state->pendingProgress = ProgressUpdate{downloaded, total, statusText};
+                    }
+                    PostMessageW(window, kProgressUpdateMessage, 0, 0);
                 },
                 cancelEvent
             );
@@ -1379,13 +1478,19 @@ void StartWhisperInstallWorker(DialogState* state) {
             config->whisperBackend = status.whisperBackend;
             PostMessageW(window, kProgressDoneMessage, TRUE, 0);
         } catch (const std::exception& ex) {
-            auto* error = new std::wstring(ex.what(), ex.what() + std::strlen(ex.what()));
-            PostMessageW(window, kProgressDoneMessage, FALSE, reinterpret_cast<LPARAM>(error));
+            {
+                std::lock_guard lock(state->progressMutex);
+                state->progressError = std::wstring(ex.what(), ex.what() + std::strlen(ex.what()));
+            }
+            PostMessageW(window, kProgressDoneMessage, FALSE, 0);
         } catch (...) {
-            auto* error = new std::wstring(L"Неизвестная ошибка установки whisper.cpp");
-            PostMessageW(window, kProgressDoneMessage, FALSE, reinterpret_cast<LPARAM>(error));
+            {
+                std::lock_guard lock(state->progressMutex);
+                state->progressError = L"Неизвестная ошибка установки whisper.cpp";
+            }
+            PostMessageW(window, kProgressDoneMessage, FALSE, 0);
         }
-    }).detach();
+    });
 }
 
 void StartWhisperModelDownloadWorker(DialogState* state) {
@@ -1399,30 +1504,36 @@ void StartWhisperModelDownloadWorker(DialogState* state) {
     AppConfig* config = state->config;
     HANDLE cancelEvent = state->cancelEvent;
 
-    std::thread([window, paths, model, config, cancelEvent]() {
+    state->worker = std::jthread([state, window, paths, model, config, cancelEvent](std::stop_token) {
         try {
             const std::filesystem::path modelPath = WhisperManager::DownloadModel(
                 paths,
                 model,
-                [window](std::uint64_t downloaded, std::uint64_t total, const std::wstring& statusText) {
-                    auto* update = new ProgressUpdate{};
-                    update->downloaded = downloaded;
-                    update->total = total;
-                    update->status = statusText;
-                    PostMessageW(window, kProgressUpdateMessage, 0, reinterpret_cast<LPARAM>(update));
+                [state, window](std::uint64_t downloaded, std::uint64_t total, const std::wstring& statusText) {
+                    {
+                        std::lock_guard lock(state->progressMutex);
+                        state->pendingProgress = ProgressUpdate{downloaded, total, statusText};
+                    }
+                    PostMessageW(window, kProgressUpdateMessage, 0, 0);
                 },
                 cancelEvent
             );
             config->whisperModelPath = modelPath;
             PostMessageW(window, kProgressDoneMessage, TRUE, 0);
         } catch (const std::exception& ex) {
-            auto* error = new std::wstring(ex.what(), ex.what() + std::strlen(ex.what()));
-            PostMessageW(window, kProgressDoneMessage, FALSE, reinterpret_cast<LPARAM>(error));
+            {
+                std::lock_guard lock(state->progressMutex);
+                state->progressError = std::wstring(ex.what(), ex.what() + std::strlen(ex.what()));
+            }
+            PostMessageW(window, kProgressDoneMessage, FALSE, 0);
         } catch (...) {
-            auto* error = new std::wstring(L"Неизвестная ошибка скачивания модели Whisper");
-            PostMessageW(window, kProgressDoneMessage, FALSE, reinterpret_cast<LPARAM>(error));
+            {
+                std::lock_guard lock(state->progressMutex);
+                state->progressError = L"Неизвестная ошибка скачивания модели Whisper";
+            }
+            PostMessageW(window, kProgressDoneMessage, FALSE, 0);
         }
-    }).detach();
+    });
 }
 
 void StartAppUpdateWorker(DialogState* state) {
@@ -1435,17 +1546,17 @@ void StartAppUpdateWorker(DialogState* state) {
     const ReleaseAssetInfo release = state->release;
     HANDLE cancelEvent = state->cancelEvent;
 
-    std::thread([window, paths, release, cancelEvent]() {
+    state->worker = std::jthread([state, window, paths, release, cancelEvent](std::stop_token) {
         try {
             const std::filesystem::path downloadedExe = AppUpdateService::DownloadUpdateExe(
                 paths,
                 release,
-                [window](std::uint64_t downloaded, std::uint64_t total) {
-                    auto* update = new ProgressUpdate{};
-                    update->downloaded = downloaded;
-                    update->total = total;
-                    update->status = L"Скачивание обновления...";
-                    PostMessageW(window, kProgressUpdateMessage, 0, reinterpret_cast<LPARAM>(update));
+                [state, window](std::uint64_t downloaded, std::uint64_t total) {
+                    {
+                        std::lock_guard lock(state->progressMutex);
+                        state->pendingProgress = ProgressUpdate{downloaded, total, L"Скачивание обновления..."};
+                    }
+                    PostMessageW(window, kProgressUpdateMessage, 0, 0);
                 },
                 cancelEvent
             );
@@ -1455,13 +1566,19 @@ void StartAppUpdateWorker(DialogState* state) {
             AppUpdateService::StartDownloadedUpdate(paths, downloadedExe);
             PostMessageW(window, kProgressDoneMessage, TRUE, 0);
         } catch (const std::exception& ex) {
-            auto* error = new std::wstring(ex.what(), ex.what() + std::strlen(ex.what()));
-            PostMessageW(window, kProgressDoneMessage, FALSE, reinterpret_cast<LPARAM>(error));
+            {
+                std::lock_guard lock(state->progressMutex);
+                state->progressError = std::wstring(ex.what(), ex.what() + std::strlen(ex.what()));
+            }
+            PostMessageW(window, kProgressDoneMessage, FALSE, 0);
         } catch (...) {
-            auto* error = new std::wstring(L"Неизвестная ошибка обновления приложения");
-            PostMessageW(window, kProgressDoneMessage, FALSE, reinterpret_cast<LPARAM>(error));
+            {
+                std::lock_guard lock(state->progressMutex);
+                state->progressError = L"Неизвестная ошибка обновления приложения";
+            }
+            PostMessageW(window, kProgressDoneMessage, FALSE, 0);
         }
-    }).detach();
+    });
 }
 
 void CreateProgressControls(DialogState* state) {
@@ -1574,6 +1691,7 @@ void CreateSettingsControls(DialogState* state) {
 void RegisterDialogClasses(HINSTANCE instance) {
     WNDCLASSEXW dialogClass = {};
     dialogClass.cbSize = sizeof(dialogClass);
+    dialogClass.style = CS_HREDRAW | CS_VREDRAW;
     dialogClass.lpfnWndProc = DialogWindowProc;
     dialogClass.hInstance = instance;
     dialogClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
@@ -1598,6 +1716,25 @@ void RegisterDialogClasses(HINSTANCE instance) {
     scrollTextClass.hbrBackground = nullptr;
     scrollTextClass.lpszClassName = kScrollTextClassName;
     RegisterClassExW(&scrollTextClass);
+
+    WNDCLASSEXW logViewClass = {};
+    logViewClass.cbSize = sizeof(logViewClass);
+    logViewClass.style = CS_HREDRAW | CS_VREDRAW;
+    logViewClass.lpfnWndProc = LogViewProc;
+    logViewClass.hInstance = instance;
+    logViewClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    logViewClass.hbrBackground = nullptr;
+    logViewClass.lpszClassName = kLogViewClassName;
+    RegisterClassExW(&logViewClass);
+
+    WNDCLASSEXW logMenuClass = {};
+    logMenuClass.cbSize = sizeof(logMenuClass);
+    logMenuClass.lpfnWndProc = LogCopyMenuProc;
+    logMenuClass.hInstance = instance;
+    logMenuClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    logMenuClass.hbrBackground = nullptr;
+    logMenuClass.lpszClassName = kLogCopyMenuClassName;
+    RegisterClassExW(&logMenuClass);
 }
 
 LRESULT CALLBACK DialogWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -1612,6 +1749,15 @@ LRESULT CALLBACK DialogWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
     }
 
     switch (message) {
+    case WM_GETMINMAXINFO:
+        if (state && state->type == DialogType::Logs) {
+            auto* minMaxInfo = reinterpret_cast<MINMAXINFO*>(lParam);
+            minMaxInfo->ptMinTrackSize.x = 720;
+            minMaxInfo->ptMinTrackSize.y = 460;
+            return 0;
+        }
+        break;
+
     case WM_CREATE:
         if (state) {
             if (state->type == DialogType::Settings) {
@@ -1624,6 +1770,8 @@ LRESULT CALLBACK DialogWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
                 CreateFfmpegControls(state);
             } else if (state->type == DialogType::Progress) {
                 CreateProgressControls(state);
+            } else if (state->type == DialogType::Logs) {
+                CreateLogsControls(state);
             } else {
                 CreateMessageControls(state);
             }
@@ -1636,6 +1784,10 @@ LRESULT CALLBACK DialogWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
     case WM_SIZE:
         if (state) {
             LayoutDialog(state, LOWORD(lParam), HIWORD(lParam));
+            InvalidateRect(window, nullptr, TRUE);
+            if (state->logView) {
+                InvalidateRect(state->logView, nullptr, TRUE);
+            }
         }
         return 0;
 
@@ -1655,6 +1807,8 @@ LRESULT CALLBACK DialogWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
                     DrawFfmpegDialog(state, dc, client);
                 } else if (state->type == DialogType::Progress) {
                     DrawProgressDialog(state, dc, client);
+                } else if (state->type == DialogType::Logs) {
+                    DrawLogsDialog(state, dc, client);
                 } else {
                     DrawMessageDialog(state, dc, client);
                 }
@@ -1812,7 +1966,7 @@ LRESULT CALLBACK DialogWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
                 InvalidateRect(state->window, &kParallelValueRect, FALSE);
                 return 0;
             case IdCopy:
-                CopyToClipboard(window, state->message);
+                CopyTextToClipboard(window, state->message);
                 return 0;
             case IdCheckUpdates:
                 if (!state->paths) {
@@ -1830,8 +1984,6 @@ LRESULT CALLBACK DialogWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
             case IdAbout:
                 if (state->paths) {
                     ShowAboutDialog(window, state->instance, *state->paths);
-                } else {
-                    ShowAboutDialog(window, state->instance);
                 }
                 return 0;
             case IdFfmpeg:
@@ -1844,8 +1996,6 @@ LRESULT CALLBACK DialogWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
                             *state->savedResult = true;
                         }
                     }
-                } else {
-                    ShowFfmpegDialog(window, state->instance);
                 }
                 return 0;
             case IdInstall:
@@ -1915,7 +2065,15 @@ LRESULT CALLBACK DialogWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
 
     case kProgressUpdateMessage:
         if (state && state->type == DialogType::Progress) {
-            std::unique_ptr<ProgressUpdate> update(reinterpret_cast<ProgressUpdate*>(lParam));
+            std::optional<ProgressUpdate> update;
+            {
+                std::lock_guard lock(state->progressMutex);
+                update = std::move(state->pendingProgress);
+                state->pendingProgress.reset();
+            }
+            if (!update) {
+                return 0;
+            }
             const bool repaint = ShouldRepaintProgress(state, *update);
             state->message = update->status;
             state->progressDownloaded = update->downloaded;
@@ -1948,7 +2106,12 @@ LRESULT CALLBACK DialogWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
                     return 0;
                 }
             } else {
-                std::unique_ptr<std::wstring> error(reinterpret_cast<std::wstring*>(lParam));
+                std::optional<std::wstring> error;
+                {
+                    std::lock_guard lock(state->progressMutex);
+                    error = std::move(state->progressError);
+                    state->progressError.reset();
+                }
                 if (error) {
                     state->message = *error;
                 } else if (state->progressMode == ProgressMode::AppUpdate) {
@@ -1990,6 +2153,13 @@ LRESULT CALLBACK DialogWindowProc(HWND window, UINT message, WPARAM wParam, LPAR
                 }
             }
             state->tooltips.clear();
+        }
+        if (state && state->worker.joinable()) {
+            if (state->cancelEvent) {
+                SetEvent(state->cancelEvent);
+            }
+            state->worker.request_stop();
+            state->worker.join();
         }
         if (state && state->cancelEvent) {
             CloseHandle(state->cancelEvent);
@@ -2116,6 +2286,21 @@ bool ClampScroll(HWND window, ScrollTextState* state, int visibleHeight) {
 }
 
 bool SetScrollY(HWND window, ScrollTextState* state, int desiredScrollY, int visibleHeight) {
+    const int previousScrollY = state->scrollY;
+    state->scrollY = desiredScrollY;
+    ClampScroll(window, state, visibleHeight);
+    return state->scrollY != previousScrollY;
+}
+
+bool ClampScroll(HWND window, LogViewState* state, int visibleHeight) {
+    UNREFERENCED_PARAMETER(window);
+    const int previousScrollY = state->scrollY;
+    const int maxScroll = std::max(0, state->contentHeight - visibleHeight);
+    state->scrollY = std::clamp(state->scrollY, 0, maxScroll);
+    return state->scrollY != previousScrollY;
+}
+
+bool SetScrollY(HWND window, LogViewState* state, int desiredScrollY, int visibleHeight) {
     const int previousScrollY = state->scrollY;
     state->scrollY = desiredScrollY;
     ClampScroll(window, state, visibleHeight);
@@ -2271,6 +2456,417 @@ LRESULT CALLBACK ScrollTextProc(HWND window, UINT message, WPARAM wParam, LPARAM
     return DefWindowProcW(window, message, wParam, lParam);
 }
 
+std::vector<std::wstring> SplitLogLines(const std::wstring& text) {
+    std::vector<std::wstring> lines;
+    size_t start = 0;
+    while (start <= text.size()) {
+        const size_t end = text.find(L'\n', start);
+        std::wstring line = end == std::wstring::npos
+            ? text.substr(start)
+            : text.substr(start, end - start);
+        if (!line.empty() && line.back() == L'\r') {
+            line.pop_back();
+        }
+        lines.push_back(std::move(line));
+        if (end == std::wstring::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+    if (lines.empty()) {
+        lines.push_back({});
+    }
+    return lines;
+}
+
+void RebuildLogLayout(HDC dc, HFONT font, LogViewState* state, const RECT& client) {
+    const int textWidth = std::max(40, static_cast<int>(client.right - client.left) - 42);
+    int y = kScrollTextTopPadding;
+    state->layouts.clear();
+    state->layouts.reserve(state->lines.size());
+    for (const std::wstring& line : state->lines) {
+        const int textHeight = std::max(18, MeasureTextHeight(dc, font, line.empty() ? L" " : line, textWidth));
+        LogLineLayout layout;
+        layout.rect = {0, y, textWidth, y + textHeight + 8};
+        state->layouts.push_back(layout);
+        y = layout.rect.bottom;
+    }
+    state->contentHeight = y + kScrollTextBottomPadding;
+    ClampScroll(nullptr, state, GetScrollVisibleEnd(client));
+}
+
+int HitTestLogLine(LogViewState* state, int contentY) {
+    for (size_t index = 0; index < state->layouts.size(); ++index) {
+        const RECT& rect = state->layouts[index].rect;
+        if (contentY >= rect.top && contentY < rect.bottom) {
+            return static_cast<int>(index);
+        }
+    }
+    return -1;
+}
+
+void ShowLogCopyMenu(HWND owner, HINSTANCE instance, POINT screenPoint, const std::wstring& text) {
+    if (text.empty()) {
+        return;
+    }
+
+    auto* state = new LogCopyMenuState{};
+    state->owner = owner;
+    state->text = text;
+
+    constexpr int menuWidth = 148;
+    constexpr int menuHeight = 36;
+    RECT workArea = {};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+    const int x = std::max(
+        static_cast<int>(workArea.left),
+        std::min(static_cast<int>(screenPoint.x), static_cast<int>(workArea.right) - menuWidth)
+    );
+    const int y = std::max(
+        static_cast<int>(workArea.top),
+        std::min(static_cast<int>(screenPoint.y), static_cast<int>(workArea.bottom) - menuHeight)
+    );
+
+    HWND menu = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        kLogCopyMenuClassName,
+        L"",
+        WS_POPUP,
+        x,
+        y,
+        menuWidth,
+        menuHeight,
+        owner,
+        nullptr,
+        instance,
+        state
+    );
+    if (!menu) {
+        delete state;
+        return;
+    }
+    ShowWindow(menu, SW_SHOW);
+    SetFocus(menu);
+}
+
+HWND CreateLogView(HWND parent, HINSTANCE instance, const std::wstring& text) {
+    auto* state = new LogViewState{};
+    state->text = text;
+    state->lines = SplitLogLines(text);
+
+    HWND view = CreateWindowExW(
+        0,
+        kLogViewClassName,
+        L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        0,
+        0,
+        10,
+        10,
+        parent,
+        nullptr,
+        instance,
+        state
+    );
+    if (!view) {
+        delete state;
+    }
+    return view;
+}
+
+LRESULT CALLBACK LogCopyMenuProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    LogCopyMenuState* state = reinterpret_cast<LogCopyMenuState*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        const CREATESTRUCTW* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        state = static_cast<LogCopyMenuState*>(create->lpCreateParams);
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+        return TRUE;
+    }
+
+    switch (message) {
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_MOUSEMOVE:
+        if (state && !state->hot) {
+            state->hot = true;
+            TRACKMOUSEEVENT track = {};
+            track.cbSize = sizeof(track);
+            track.dwFlags = TME_LEAVE;
+            track.hwndTrack = window;
+            TrackMouseEvent(&track);
+            InvalidateRect(window, nullptr, FALSE);
+        }
+        return 0;
+
+    case WM_MOUSELEAVE:
+        if (state && state->hot) {
+            state->hot = false;
+            InvalidateRect(window, nullptr, FALSE);
+        }
+        return 0;
+
+    case WM_PAINT:
+        PaintBuffered(window, [state](HDC dc, const RECT& client) {
+            const std::vector<UiRenderer::PopupMenuItem> items = {
+                {1, L"Копировать", false}
+            };
+            UiRenderer::DrawPopupMenu(dc, client, items, state && state->hot ? 1 : 0);
+        });
+        return 0;
+
+    case WM_LBUTTONUP:
+        if (state) {
+            CopyTextToClipboard(state->owner ? state->owner : window, state->text);
+        }
+        DestroyWindow(window);
+        return 0;
+
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE) {
+            DestroyWindow(window);
+            return 0;
+        }
+        if (wParam == VK_RETURN || wParam == VK_SPACE) {
+            if (state) {
+                CopyTextToClipboard(state->owner ? state->owner : window, state->text);
+            }
+            DestroyWindow(window);
+            return 0;
+        }
+        break;
+
+    case WM_KILLFOCUS:
+        DestroyWindow(window);
+        return 0;
+
+    case WM_NCDESTROY:
+        delete state;
+        SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+        return 0;
+    }
+
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+LRESULT CALLBACK LogViewProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    LogViewState* state = reinterpret_cast<LogViewState*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        const CREATESTRUCTW* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        state = static_cast<LogViewState*>(create->lpCreateParams);
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+        return TRUE;
+    }
+
+    switch (message) {
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_MOUSEWHEEL:
+        if (state) {
+            RECT client = {};
+            GetClientRect(window, &client);
+            const int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+            const int desiredScrollY = state->scrollY - ((delta / WHEEL_DELTA) * 44);
+            if (SetScrollY(window, state, desiredScrollY, GetScrollVisibleEnd(client))) {
+                InvalidateRect(window, nullptr, FALSE);
+            }
+        }
+        return 0;
+
+    case WM_LBUTTONDOWN:
+    case WM_RBUTTONUP:
+    case WM_CONTEXTMENU:
+        if (state) {
+            SetFocus(window);
+            RECT client = {};
+            GetClientRect(window, &client);
+            POINT point = {};
+            if (message == WM_CONTEXTMENU) {
+                point = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+                if (point.x == -1 && point.y == -1) {
+                    if (state->selectedLine >= 0 && state->selectedLine < static_cast<int>(state->layouts.size())) {
+                        const RECT selected = state->layouts[static_cast<size_t>(state->selectedLine)].rect;
+                        point = {client.left + 18, client.top + selected.top - state->scrollY + 4};
+                    } else {
+                        return 0;
+                    }
+                } else {
+                    ScreenToClient(window, &point);
+                }
+            } else {
+                point = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            }
+            RECT thumb = GetScrollbarThumb(client, state->contentHeight, state->scrollY);
+            if (message == WM_LBUTTONDOWN &&
+                state->contentHeight > GetScrollVisibleEnd(client) &&
+                PtInRect(&thumb, point)) {
+                state->draggingThumb = true;
+                state->dragStartY = point.y;
+                state->dragStartScrollY = state->scrollY;
+                SetCapture(window);
+                return 0;
+            }
+
+            HDC dc = GetDC(window);
+            HFONT font = CreateUiFont(-13, FW_NORMAL);
+            RebuildLogLayout(dc, font, state, client);
+            DeleteObject(font);
+            ReleaseDC(window, dc);
+
+            const int hit = HitTestLogLine(state, point.y + state->scrollY);
+            if (hit >= 0) {
+                state->selectedLine = hit;
+                InvalidateRect(window, nullptr, FALSE);
+                if (message == WM_RBUTTONUP || message == WM_CONTEXTMENU) {
+                    POINT screenPoint = point;
+                    ClientToScreen(window, &screenPoint);
+                    HINSTANCE instance = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(window, GWLP_HINSTANCE));
+                    ShowLogCopyMenu(window, instance, screenPoint, state->lines[static_cast<size_t>(hit)]);
+                }
+            }
+        }
+        return 0;
+
+    case WM_MOUSEMOVE:
+        if (state && state->draggingThumb) {
+            RECT client = {};
+            GetClientRect(window, &client);
+            RECT thumb = GetScrollbarThumb(client, state->contentHeight, state->scrollY);
+            const int visibleHeight = GetScrollVisibleEnd(client);
+            const int maxScroll = std::max(0, state->contentHeight - visibleHeight);
+            const int trackTravel = std::max(
+                1,
+                static_cast<int>(client.bottom - client.top) - 12 - static_cast<int>(thumb.bottom - thumb.top)
+            );
+            const int dy = GET_Y_LPARAM(lParam) - state->dragStartY;
+            const int desiredScrollY = state->dragStartScrollY + (dy * maxScroll) / trackTravel;
+            if (SetScrollY(window, state, desiredScrollY, visibleHeight)) {
+                InvalidateRect(window, nullptr, FALSE);
+            }
+        }
+        return 0;
+
+    case WM_LBUTTONUP:
+        if (state && state->draggingThumb) {
+            state->draggingThumb = false;
+            if (GetCapture() == window) {
+                ReleaseCapture();
+            }
+        }
+        return 0;
+
+    case WM_KEYDOWN:
+        if (state) {
+            const bool controlDown = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+            if (controlDown && wParam == 'C' && state->selectedLine >= 0 &&
+                state->selectedLine < static_cast<int>(state->lines.size())) {
+                CopyTextToClipboard(window, state->lines[static_cast<size_t>(state->selectedLine)]);
+                return 0;
+            }
+        }
+        break;
+
+    case WM_PAINT:
+        if (state) {
+            PaintBuffered(window, [window, state](HDC dc, const RECT& client) {
+                UiRenderer::DrawInputFrame(dc, client);
+
+                HFONT font = CreateUiFont(-13, FW_NORMAL);
+                RebuildLogLayout(dc, font, state, client);
+
+                HRGN clip = CreateRectRgn(
+                    client.left + 10,
+                    client.top + kScrollTextClipTopPadding,
+                    client.right - 16,
+                    client.bottom - kScrollTextClipBottomPadding
+                );
+                SelectClipRgn(dc, clip);
+
+                const int textLeft = client.left + 14;
+                const int textRight = client.right - 28;
+                for (size_t index = 0; index < state->lines.size(); ++index) {
+                    const RECT layout = state->layouts[index].rect;
+                    RECT visualRect = {
+                        textLeft,
+                        client.top + layout.top - state->scrollY,
+                        textRight,
+                        client.top + layout.bottom - state->scrollY
+                    };
+                    if (visualRect.bottom < client.top || visualRect.top > client.bottom) {
+                        continue;
+                    }
+                    if (static_cast<int>(index) == state->selectedLine) {
+                        Gdiplus::Graphics graphics(dc);
+                        graphics.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+                        RECT selected = {visualRect.left - 6, visualRect.top - 2, visualRect.right + 2, visualRect.bottom - 4};
+                        Gdiplus::GraphicsPath path;
+                        AddRoundedRect(path, selected, 5);
+                        Gdiplus::SolidBrush fill(Gdiplus::Color(255, 48, 48, 54));
+                        graphics.FillPath(&fill, &path);
+                    }
+
+                    RECT textRect = {
+                        visualRect.left,
+                        visualRect.top,
+                        visualRect.right,
+                        visualRect.bottom - 6
+                    };
+                    DrawTextBlock(
+                        dc,
+                        state->lines[index],
+                        textRect,
+                        kTextColor,
+                        font,
+                        DT_LEFT | DT_WORDBREAK
+                    );
+                }
+                SelectClipRgn(dc, nullptr);
+                DeleteObject(clip);
+
+                if (state->contentHeight > GetScrollVisibleEnd(client)) {
+                    Gdiplus::Graphics graphics(dc);
+                    graphics.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+                    RECT thumb = GetScrollbarThumb(client, state->contentHeight, state->scrollY);
+                    Gdiplus::SolidBrush trackBrush(Gdiplus::Color(255, 39, 39, 43));
+                    Gdiplus::SolidBrush thumbBrush(Gdiplus::Color(255, 86, 86, 92));
+                    graphics.FillRectangle(
+                        &trackBrush,
+                        static_cast<INT>(client.right - 14),
+                        static_cast<INT>(client.top + 8),
+                        6,
+                        static_cast<INT>(client.bottom - client.top - 16)
+                    );
+                    graphics.FillRectangle(
+                        &thumbBrush,
+                        static_cast<INT>(thumb.left),
+                        static_cast<INT>(thumb.top),
+                        static_cast<INT>(thumb.right - thumb.left),
+                        static_cast<INT>(thumb.bottom - thumb.top)
+                    );
+                }
+
+                DeleteObject(font);
+            });
+        }
+        return 0;
+
+    case WM_SIZE:
+        if (state) {
+            state->layouts.clear();
+            InvalidateRect(window, nullptr, FALSE);
+        }
+        return 0;
+
+    case WM_NCDESTROY:
+        delete state;
+        SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+        return 0;
+    }
+
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
 bool ShowConfirmationDialog(
     HWND owner,
     HINSTANCE instance,
@@ -2311,14 +2907,14 @@ void ShowErrorDialog(HWND owner, HINSTANCE instance, const std::wstring& title, 
     ShowModal(state, 620, 420);
 }
 
-void ShowSettingsDialog(HWND owner, HINSTANCE instance) {
-    AppConfig ignored;
-    ShowSettingsDialog(owner, instance, ignored);
-}
-
-bool ShowSettingsDialog(HWND owner, HINSTANCE instance, AppConfig& config) {
-    AppPaths emptyPaths(std::filesystem::path{});
-    return ShowSettingsDialog(owner, instance, emptyPaths, config);
+void ShowLogsDialog(HWND owner, HINSTANCE instance, const std::wstring& logText) {
+    auto* state = new DialogState{};
+    state->type = DialogType::Logs;
+    state->instance = instance;
+    state->owner = owner;
+    state->title = L"Логи";
+    state->message = logText.empty() ? L"Лог пока пуст." : logText;
+    ShowModal(state, 860, 560);
 }
 
 bool ShowSettingsDialog(HWND owner, HINSTANCE instance, const AppPaths& paths, AppConfig& config) {
@@ -2336,11 +2932,6 @@ bool ShowSettingsDialog(HWND owner, HINSTANCE instance, const AppPaths& paths, A
     return saved;
 }
 
-void ShowAboutDialog(HWND owner, HINSTANCE instance) {
-    AppPaths emptyPaths(std::filesystem::path{});
-    ShowAboutDialog(owner, instance, emptyPaths);
-}
-
 void ShowAboutDialog(HWND owner, HINSTANCE instance, const AppPaths& paths) {
     auto* state = new DialogState{};
     state->type = DialogType::About;
@@ -2354,12 +2945,6 @@ void ShowAboutDialog(HWND owner, HINSTANCE instance, const AppPaths& paths) {
         L"Поддерживает расшифровку аудиодорожек через Whisper.cpp.\n\n"
         L"Версия: " YTD_APP_VERSION_WIDE;
     ShowModal(state, 560, 360);
-}
-
-void ShowFfmpegDialog(HWND owner, HINSTANCE instance) {
-    AppConfig ignored;
-    AppPaths emptyPaths(std::filesystem::path{});
-    ShowFfmpegDialog(owner, instance, emptyPaths, ignored);
 }
 
 bool ShowFfmpegDialog(HWND owner, HINSTANCE instance, const AppPaths& paths, AppConfig& config) {

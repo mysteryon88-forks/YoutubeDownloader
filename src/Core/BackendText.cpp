@@ -11,6 +11,46 @@
 #include <stdexcept>
 #include <vector>
 
+namespace {
+
+const wchar_t* RussianPlural(
+    std::uint64_t value,
+    const wchar_t* singular,
+    const wchar_t* few,
+    const wchar_t* many
+) {
+    const std::uint64_t lastTwo = value % 100;
+    if (lastTwo >= 11 && lastTwo <= 14) {
+        return many;
+    }
+
+    switch (value % 10) {
+    case 1:
+        return singular;
+    case 2:
+    case 3:
+    case 4:
+        return few;
+    default:
+        return many;
+    }
+}
+
+void AddElapsedPart(
+    std::vector<std::wstring>& parts,
+    std::uint64_t value,
+    const wchar_t* singular,
+    const wchar_t* few,
+    const wchar_t* many
+) {
+    if (value == 0) {
+        return;
+    }
+    parts.push_back(std::to_wstring(value) + L" " + RussianPlural(value, singular, few, many));
+}
+
+} // namespace
+
 std::string WideToUtf8(const std::wstring& value) {
     if (value.empty()) {
         return {};
@@ -159,6 +199,37 @@ std::wstring FormatDuration(std::uint64_t seconds) {
         }
     } else {
         parts.push_back(std::to_wstring(seconds) + L" с");
+    }
+
+    std::wstring result;
+    for (const std::wstring& part : parts) {
+        if (!result.empty()) {
+            result += L" ";
+        }
+        result += part;
+    }
+    return result;
+}
+
+std::wstring FormatElapsedDuration(std::uint64_t seconds) {
+    constexpr std::uint64_t kMinute = 60;
+    constexpr std::uint64_t kHour = 60 * kMinute;
+    constexpr std::uint64_t kDay = 24 * kHour;
+
+    const std::uint64_t days = seconds / kDay;
+    seconds %= kDay;
+    const std::uint64_t hours = seconds / kHour;
+    seconds %= kHour;
+    const std::uint64_t minutes = seconds / kMinute;
+    seconds %= kMinute;
+
+    std::vector<std::wstring> parts;
+    AddElapsedPart(parts, days, L"день", L"дня", L"дней");
+    AddElapsedPart(parts, hours, L"час", L"часа", L"часов");
+    AddElapsedPart(parts, minutes, L"минута", L"минуты", L"минут");
+    AddElapsedPart(parts, seconds, L"секунда", L"секунды", L"секунд");
+    if (parts.empty()) {
+        return L"0 секунд";
     }
 
     std::wstring result;

@@ -1,16 +1,31 @@
 #include "DownloadQueue.h"
 
+#include "BackendText.h"
 #include "Logger.h"
 #include "ProcessRunner.h"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <ranges>
 #include <string_view>
 #include <system_error>
 
 namespace {
+
+std::uint64_t ElapsedSecondsSince(std::chrono::steady_clock::time_point startedAt) {
+    if (startedAt == std::chrono::steady_clock::time_point{}) {
+        return 0;
+    }
+
+    const auto elapsed = std::chrono::steady_clock::now() - startedAt;
+    const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+    if (milliseconds <= 0) {
+        return 1;
+    }
+    return static_cast<std::uint64_t>((milliseconds + 999) / 1000);
+}
 
 void AddUniquePath(std::vector<std::filesystem::path>& paths, const std::filesystem::path& path) {
     if (path.empty()) {
@@ -327,6 +342,7 @@ bool DownloadQueue::Retry(int id) {
     }
     task.cancelRequested = false;
     task.postProcessingOnly = false;
+    task.startedAt = {};
     task.snapshot.state = DownloadTaskState::Queued;
     task.snapshot.percent = 0.0;
     task.snapshot.errorText.clear();
@@ -611,6 +627,7 @@ void DownloadQueue::SchedulerLoop() {
             const int id = nextTask->first;
             nextTask->second.active = true;
             nextTask->second.postProcessingOnly = false;
+            nextTask->second.startedAt = std::chrono::steady_clock::now();
             nextTask->second.snapshot.state = DownloadTaskState::Preparing;
             nextTask->second.snapshot.statusText = L"Подготовка";
             ++m_revision;
@@ -775,7 +792,16 @@ void DownloadQueue::FinishTask(int id, std::stop_token stopToken, const Download
     } else if (result.success) {
         it->second.snapshot.state = DownloadTaskState::Completed;
         it->second.snapshot.percent = 100.0;
-        it->second.snapshot.statusText = result.statusText.empty() ? L"Готово" : result.statusText;
+        if (!result.statusText.empty()) {
+            it->second.snapshot.statusText = result.statusText;
+        } else if (postProcessingOnly) {
+            it->second.snapshot.statusText = L"Готово";
+        } else {
+            const std::uint64_t elapsedSeconds = ElapsedSecondsSince(it->second.startedAt);
+            it->second.snapshot.statusText = elapsedSeconds == 0
+                ? L"Готово"
+                : L"Готово · скачано за " + FormatElapsedDuration(elapsedSeconds);
+        }
         for (const std::filesystem::path& path : result.outputFiles) {
             AddUniquePath(it->second.snapshot.outputFiles, path);
         }
@@ -814,6 +840,7 @@ void DownloadQueue::FinishTask(int id, std::stop_token stopToken, const Download
         }
         ++m_revision;
     }
+    it->second.startedAt = {};
     m_finishedWorkerIds.push_back(id);
 }
 

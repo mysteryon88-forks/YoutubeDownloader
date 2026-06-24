@@ -57,6 +57,21 @@ struct ToolInstallStatus {
     WhisperBackend whisperBackend = WhisperBackend::Auto;
 };
 
+struct VotCliStatus {
+    bool available = false;
+    bool nodeAvailable = false;
+    std::filesystem::path executable;
+    std::filesystem::path nodeExecutable;
+    std::wstring message;
+};
+
+struct ToolProcessInvocation {
+    std::filesystem::path executable;
+    std::vector<std::wstring> arguments;
+};
+
+ToolProcessInvocation BuildVotCliInstallInvocation(const std::filesystem::path& npmExecutable);
+
 struct WhisperModelInfo {
     std::wstring id;
     std::wstring name;
@@ -102,6 +117,16 @@ public:
     static std::filesystem::path DownloadModel(
         const AppPaths& paths,
         const WhisperModelInfo& model,
+        const std::function<void(std::uint64_t downloaded, std::uint64_t total, const std::wstring& status)>& onProgress = {},
+        HANDLE cancelEvent = nullptr
+    );
+};
+
+class VotCliManager {
+public:
+    static VotCliStatus Resolve(const AppConfig& config);
+    static VotCliStatus ResolveUserPath(const std::filesystem::path& path);
+    static VotCliStatus InstallGlobal(
         const std::function<void(std::uint64_t downloaded, std::uint64_t total, const std::wstring& status)>& onProgress = {},
         HANDLE cancelEvent = nullptr
     );

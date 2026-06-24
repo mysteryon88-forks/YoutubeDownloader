@@ -26,6 +26,32 @@ bool IsTranscriptTextPath(const std::filesystem::path& path) {
     return Lowercase(path.extension().wstring()) == L".txt";
 }
 
+bool IsVoiceOverVideoPathForLanguage(const std::filesystem::path& path, const std::wstring& language) {
+    const std::wstring extension = Lowercase(path.extension().wstring());
+    if (extension != L".mp4" && extension != L".mkv") {
+        return false;
+    }
+
+    std::wstring safeLanguage;
+    safeLanguage.reserve(language.size());
+    for (wchar_t ch : language) {
+        if ((ch >= L'0' && ch <= L'9') ||
+            (ch >= L'a' && ch <= L'z') ||
+            (ch >= L'A' && ch <= L'Z') ||
+            ch == L'-' ||
+            ch == L'_') {
+            safeLanguage.push_back(static_cast<wchar_t>(std::towlower(ch)));
+        }
+    }
+    if (safeLanguage.empty()) {
+        safeLanguage = L"ru";
+    }
+
+    const std::wstring filename = Lowercase(path.filename().wstring());
+    return filename.find(L".vot." + safeLanguage + extension) != std::wstring::npos ||
+           filename.find(L".vot-mixed." + safeLanguage + extension) != std::wstring::npos;
+}
+
 } // namespace
 
 DownloadAttemptAction ResolveDownloadAttempt(bool ytDlpReady, bool previewLoading) {
@@ -96,6 +122,23 @@ std::filesystem::path FindTranscriptTextPath(const std::vector<std::filesystem::
     std::error_code ec;
     for (auto it = outputFiles.rbegin(); it != outputFiles.rend(); ++it) {
         if (!IsTranscriptTextPath(*it)) {
+            continue;
+        }
+        if (std::filesystem::is_regular_file(*it, ec)) {
+            return *it;
+        }
+        ec.clear();
+    }
+    return {};
+}
+
+std::filesystem::path FindVoiceOverVideoPath(
+    const std::vector<std::filesystem::path>& outputFiles,
+    const std::wstring& language
+) {
+    std::error_code ec;
+    for (auto it = outputFiles.rbegin(); it != outputFiles.rend(); ++it) {
+        if (!IsVoiceOverVideoPathForLanguage(*it, language)) {
             continue;
         }
         if (std::filesystem::is_regular_file(*it, ec)) {

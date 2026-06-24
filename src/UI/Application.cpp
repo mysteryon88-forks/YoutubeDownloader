@@ -10,6 +10,7 @@
 #include "TranscriptionClient.h"
 #include "UiActions.h"
 #include "UiRenderer.h"
+#include "VoiceOverTranslationClient.h"
 
 #include <commctrl.h>
 #include <dwmapi.h>
@@ -22,6 +23,7 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <cwctype>
 #include <filesystem>
 #include <functional>
 #include <system_error>
@@ -58,12 +60,17 @@ constexpr int kQueueActionCancel = 1;
 constexpr int kQueueActionRetry = 2;
 constexpr int kQueueActionDelete = 3;
 constexpr int kQueueActionTranscript = 4;
+constexpr int kQueueActionVoiceOver = 5;
 constexpr int kQueueButtonWidth = 96;
 constexpr int kQueueTranscriptButtonWidth = 132;
+constexpr int kQueueVoiceOverButtonWidth = 104;
 constexpr int kQueueButtonHeight = 26;
 constexpr int kQueueButtonGap = 8;
 constexpr int kTranscriptMenuOpenFile = 1;
 constexpr int kTranscriptMenuRevealInExplorer = 2;
+constexpr int kVoiceOverMenuOpenVideo = 1;
+constexpr int kVoiceOverMenuRevealInExplorer = 2;
+constexpr int kVoiceOverMenuRebuild = 3;
 
 enum ControlId {
     IdUrlEdit = 1001,
@@ -364,6 +371,50 @@ DownloadTaskResult TranscribeDownloadedMedia(
     return DownloadTaskResult{true, L"", outputFiles, L"Готово · расшифровка сохранена"};
 }
 
+DownloadTaskResult TranslateDownloadedMediaVoiceOver(
+    const DownloadTaskSnapshot& task,
+    const DownloadTaskCallbacks& callbacks,
+    const VoiceOverTranslationRequest& request,
+    std::vector<std::filesystem::path> outputFiles,
+    HANDLE cancelEvent
+) {
+    UNREFERENCED_PARAMETER(task);
+    AddUniqueOutputPath(outputFiles, request.mediaPath);
+
+    if (callbacks.onPostProcessing) {
+        callbacks.onPostProcessing(0.0, L"Подготовка перевода");
+    }
+
+    const VoiceOverTranslationResult voiceOverResult = VoiceOverTranslationClient::Translate(
+        request,
+        VoiceOverTranslationCallbacks{
+            {},
+            [callbacks](double percent, const std::wstring& status) {
+                if (callbacks.onPostProcessing) {
+                    callbacks.onPostProcessing(percent, status);
+                }
+            }
+        },
+        cancelEvent
+    );
+
+    if (voiceOverResult.canceled) {
+        return DownloadTaskResult{false, L"Отменено", outputFiles, L"Готово · перевод отменен"};
+    }
+    if (!voiceOverResult.success) {
+        return DownloadTaskResult{
+            true,
+            L"",
+            outputFiles,
+            L"Готово · перевод не выполнен: " + voiceOverResult.errorText
+        };
+    }
+
+    AddUniqueOutputPath(outputFiles, voiceOverResult.audioPath);
+    AddUniqueOutputPath(outputFiles, voiceOverResult.videoPath);
+    return DownloadTaskResult{true, L"", outputFiles, L"Готово · перевод сохранен"};
+}
+
 std::filesystem::path ResolveWhisperExePath(const AppPaths& paths, const AppConfig& config) {
     const ToolInstallStatus status = WhisperManager::Resolve(paths, config);
     if (status.installed) {
@@ -374,6 +425,11 @@ std::filesystem::path ResolveWhisperExePath(const AppPaths& paths, const AppConf
 
 std::filesystem::path ResolveWhisperModelPath(const AppPaths& paths, const AppConfig& config) {
     return config.whisperModelPath.empty() ? paths.localWhisperModelPath() : config.whisperModelPath;
+}
+
+std::filesystem::path ResolveVotCliPath(const AppConfig& config) {
+    const VotCliStatus status = VotCliManager::Resolve(config);
+    return status.available ? status.executable : config.votCliPath;
 }
 
 RECT QueuePanelRectForClient(const RECT& client) {
@@ -410,6 +466,62 @@ RECT QueueTranscriptButtonRect(const RECT& row) {
     };
 }
 
+std::wstring LowerPathText(std::wstring value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](wchar_t ch) {
+        return static_cast<wchar_t>(std::towlower(ch));
+    });
+    return value;
+}
+
+bool IsLikelyVideoPath(const std::filesystem::path& path) {
+    const std::wstring extension = LowerPathText(path.extension().wstring());
+    static constexpr std::array<std::wstring_view, 7> kVideoExtensions = {
+        L".mp4",
+        L".mkv",
+        L".webm",
+        L".mov",
+        L".avi",
+        L".m4v",
+        L".ts"
+    };
+    return std::find(kVideoExtensions.begin(), kVideoExtensions.end(), extension) != kVideoExtensions.end();
+}
+
+bool IsVoiceOverGeneratedPath(const std::filesystem::path& path) {
+    const std::wstring filename = LowerPathText(path.filename().wstring());
+    return filename.find(L".vot.") != std::wstring::npos ||
+           filename.find(L".vot-mixed.") != std::wstring::npos;
+}
+
+std::filesystem::path FindVoiceOverSourceMediaFile(const DownloadTaskSnapshot& task) {
+    std::error_code ec;
+    for (auto it = task.outputFiles.rbegin(); it != task.outputFiles.rend(); ++it) {
+        if (!IsLikelyVideoPath(*it) || IsVoiceOverGeneratedPath(*it)) {
+            continue;
+        }
+        if (std::filesystem::is_regular_file(*it, ec)) {
+            return *it;
+        }
+        ec.clear();
+    }
+
+    const std::filesystem::path fallback = FindDownloadedMediaFile(task.outputFiles, task.request.outputDirectory, {});
+    if (!fallback.empty() && IsLikelyVideoPath(fallback) && !IsVoiceOverGeneratedPath(fallback)) {
+        return fallback;
+    }
+    return {};
+}
+
+bool TaskHasVoiceOverVideoPath(const DownloadTaskSnapshot& task) {
+    return !FindVoiceOverVideoPath(task.outputFiles, task.request.voiceOverLanguage).empty();
+}
+
+bool TaskCanStartVoiceOverTranslation(const DownloadTaskSnapshot& task) {
+    return task.state == DownloadTaskState::Completed &&
+           !TaskHasVoiceOverVideoPath(task) &&
+           !FindVoiceOverSourceMediaFile(task).empty();
+}
+
 bool TaskHasTranscriptTextPath(const DownloadTaskSnapshot& task) {
     return !FindTranscriptTextPath(task.outputFiles).empty();
 }
@@ -424,12 +536,29 @@ bool TaskCanStartTranscription(const DownloadTaskSnapshot& task) {
            TaskHasDownloadedMediaPath(task);
 }
 
+RECT QueueVoiceOverButtonRect(const RECT& row, const DownloadTaskSnapshot& task) {
+    const bool showsTranscript =
+        task.state == DownloadTaskState::Completed &&
+        (TaskHasTranscriptTextPath(task) || TaskCanStartTranscription(task));
+    const RECT anchor = showsTranscript ? QueueTranscriptButtonRect(row) : QueueRightButtonRect(row);
+    return {
+        anchor.left - kQueueButtonGap - kQueueVoiceOverButtonWidth,
+        anchor.top,
+        anchor.left - kQueueButtonGap,
+        anchor.bottom
+    };
+}
+
 int QueueTextRight(const RECT& row, const DownloadTaskSnapshot& task) {
     if (IsRunningTaskState(task.state)) {
         return QueueRightButtonRect(row).left - 12;
     }
     if (task.state == DownloadTaskState::Canceled || task.state == DownloadTaskState::Failed) {
         return QueueRetryButtonRect(row).left - 12;
+    }
+    if (task.state == DownloadTaskState::Completed &&
+        (TaskHasVoiceOverVideoPath(task) || TaskCanStartVoiceOverTranslation(task))) {
+        return QueueVoiceOverButtonRect(row, task).left - 12;
     }
     if (task.state == DownloadTaskState::Completed &&
         (TaskHasTranscriptTextPath(task) || TaskCanStartTranscription(task))) {
@@ -1820,9 +1949,12 @@ void Application::DrawQueueContent(HDC dc, const RECT& queueRect) {
         const RECT primaryButton = QueueRightButtonRect(row);
         const RECT retryButton = QueueRetryButtonRect(row);
         const RECT transcriptButton = QueueTranscriptButtonRect(row);
+        const RECT voiceOverButton = QueueVoiceOverButtonRect(row, task);
         const int textRight = QueueTextRight(row, task);
         const bool hasTranscript = TaskHasTranscriptTextPath(task);
         const bool canStartTranscription = TaskCanStartTranscription(task);
+        const bool hasVoiceOver = TaskHasVoiceOverVideoPath(task);
+        const bool canStartVoiceOver = TaskCanStartVoiceOverTranslation(task);
 
         RECT titleRect = {textLeft, row.top + 9, textRight, row.top + 31};
         const std::wstring title = task.title.empty() ? task.request.url : task.title;
@@ -1886,6 +2018,23 @@ void Application::DrawQueueContent(HDC dc, const RECT& queueRect) {
                 m_hotQueueTaskId == task.id && m_hotQueueAction == kQueueActionDelete
             );
         } else if (task.state == DownloadTaskState::Completed) {
+            if (hasVoiceOver) {
+                DrawSmallActionButton(
+                    dc,
+                    voiceOverButton,
+                    L"Перевод",
+                    true,
+                    m_hotQueueTaskId == task.id && m_hotQueueAction == kQueueActionVoiceOver
+                );
+            } else if (canStartVoiceOver) {
+                DrawSmallActionButton(
+                    dc,
+                    voiceOverButton,
+                    L"Перевести",
+                    true,
+                    m_hotQueueTaskId == task.id && m_hotQueueAction == kQueueActionVoiceOver
+                );
+            }
             if (hasTranscript) {
                 DrawSmallActionButton(
                     dc,
@@ -1989,6 +2138,59 @@ bool Application::ShowTranscriptActions(const DownloadTaskSnapshot& task, const 
     return true;
 }
 
+bool Application::ShowVoiceOverActions(const DownloadTaskSnapshot& task, const RECT& buttonRect) {
+    const std::filesystem::path voiceOverPath = FindVoiceOverVideoPath(
+        task.outputFiles,
+        task.request.voiceOverLanguage.empty() ? m_config.voiceOverLanguage : task.request.voiceOverLanguage
+    );
+    if (voiceOverPath.empty()) {
+        SetTransientStatus(L"Файл перевода не найден");
+        return true;
+    }
+
+    HMENU menu = CreatePopupMenu();
+    if (!menu) {
+        SetTransientStatus(L"Не удалось открыть меню перевода");
+        return true;
+    }
+    AppendMenuW(menu, MF_STRING, kVoiceOverMenuOpenVideo, L"Открыть видео");
+    AppendMenuW(menu, MF_STRING, kVoiceOverMenuRevealInExplorer, L"Показать в Проводнике");
+    AppendMenuW(menu, MF_STRING, kVoiceOverMenuRebuild, L"Пересобрать");
+
+    POINT anchor = {buttonRect.left, buttonRect.bottom};
+    ClientToScreen(m_window, &anchor);
+    const int selected = TrackPopupMenu(
+        menu,
+        TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+        anchor.x,
+        anchor.y,
+        0,
+        m_window,
+        nullptr
+    );
+    DestroyMenu(menu);
+
+    if (selected == kVoiceOverMenuOpenVideo) {
+        const std::wstring path = voiceOverPath.wstring();
+        const std::wstring directory = voiceOverPath.parent_path().wstring();
+        HINSTANCE result = ShellExecuteW(m_window, L"open", path.c_str(), nullptr, directory.c_str(), SW_SHOWNORMAL);
+        if (reinterpret_cast<INT_PTR>(result) <= 32) {
+            SetTransientStatus(L"Не удалось открыть видео с переводом");
+        } else {
+            SetTransientStatus(L"Открыт перевод: " + voiceOverPath.filename().wstring());
+        }
+    } else if (selected == kVoiceOverMenuRevealInExplorer) {
+        const std::wstring arguments = L"/select,\"" + voiceOverPath.wstring() + L"\"";
+        HINSTANCE result = ShellExecuteW(m_window, L"open", L"explorer.exe", arguments.c_str(), nullptr, SW_SHOWNORMAL);
+        if (reinterpret_cast<INT_PTR>(result) <= 32) {
+            SetTransientStatus(L"Не удалось показать перевод в Проводнике");
+        }
+    } else if (selected == kVoiceOverMenuRebuild) {
+        return StartTaskVoiceOverTranslation(task);
+    }
+    return true;
+}
+
 bool Application::StartTaskTranscription(const DownloadTaskSnapshot& task) {
     if (!m_downloadQueue) {
         return false;
@@ -2046,6 +2248,85 @@ bool Application::StartTaskTranscription(const DownloadTaskSnapshot& task) {
     return true;
 }
 
+bool Application::StartTaskVoiceOverTranslation(const DownloadTaskSnapshot& task) {
+    if (!m_downloadQueue || !m_paths) {
+        return false;
+    }
+
+    const std::filesystem::path mediaPath = FindVoiceOverSourceMediaFile(task);
+    if (mediaPath.empty()) {
+        SetTransientStatus(L"Видео для перевода не найдено");
+        return true;
+    }
+
+    m_ffmpeg = FfmpegManager::Resolve(*m_paths, m_config);
+    if (!m_ffmpeg.available) {
+        SetTransientStatus(L"FFmpeg не найден для сборки перевода");
+        return true;
+    }
+
+    const VotCliStatus votCli = VotCliManager::Resolve(m_config);
+    if (!votCli.available) {
+        SetTransientStatus(votCli.message.empty() ? L"vot-cli не найден" : votCli.message);
+        return true;
+    }
+
+    VoiceOverTranslationRequest request;
+    request.mediaPath = mediaPath;
+    request.tempDirectory = m_paths->voiceOverTempDir();
+    request.ffmpegExePath = m_ffmpeg.ffmpegExe;
+    request.votCliPath = votCli.executable;
+    request.youtubeUrl = task.request.url;
+    request.language = m_config.voiceOverLanguage.empty() ? L"ru" : m_config.voiceOverLanguage;
+    request.mode = m_config.voiceOverMode == L"mixed" ? L"mixed" : L"separate";
+    request.originalVolumePercent = std::clamp(m_config.originalVolumePercent, 0, 100);
+
+    const bool started = m_downloadQueue->StartPostProcessing(
+        task.id,
+        [request](
+            const DownloadTaskSnapshot& currentTask,
+            std::stop_token stopToken,
+            const DownloadTaskCallbacks& callbacks
+        ) {
+            HANDLE cancelEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            if (!cancelEvent) {
+                return DownloadTaskResult{true, L"", currentTask.outputFiles, L"Готово · перевод не выполнен: не удалось создать событие отмены"};
+            }
+
+            DownloadTaskResult result;
+            try {
+                std::stop_callback stopCallback(stopToken, [cancelEvent]() {
+                    SetEvent(cancelEvent);
+                });
+                result = TranslateDownloadedMediaVoiceOver(
+                    currentTask,
+                    callbacks,
+                    request,
+                    currentTask.outputFiles,
+                    cancelEvent
+                );
+            } catch (const std::exception& ex) {
+                result = DownloadTaskResult{
+                    true,
+                    L"",
+                    currentTask.outputFiles,
+                    L"Готово · перевод не выполнен: " + std::wstring(ex.what(), ex.what() + std::strlen(ex.what()))
+                };
+            } catch (...) {
+                result = DownloadTaskResult{true, L"", currentTask.outputFiles, L"Готово · перевод не выполнен: неизвестная ошибка"};
+            }
+            CloseHandle(cancelEvent);
+            return result;
+        },
+        L"Подготовка перевода"
+    );
+
+    if (!started) {
+        SetTransientStatus(L"Не удалось запустить перевод");
+    }
+    return true;
+}
+
 bool Application::HandleQueueClick(POINT point) {
     if (!m_downloadQueue) {
         return false;
@@ -2087,11 +2368,11 @@ bool Application::HandleQueueClick(POINT point) {
             continue;
         }
 
+        const DownloadTaskSnapshot& task = tasks[static_cast<size_t>(taskIndex)];
         const RECT primaryButton = QueueRightButtonRect(row);
         const RECT retryButton = QueueRetryButtonRect(row);
         const RECT transcriptButton = QueueTranscriptButtonRect(row);
-
-        const DownloadTaskSnapshot& task = tasks[static_cast<size_t>(taskIndex)];
+        const RECT voiceOverButton = QueueVoiceOverButtonRect(row, task);
         bool handled = false;
         bool removedRow = false;
         if (IsRunningTaskState(task.state) && PtInRect(&primaryButton, point)) {
@@ -2099,6 +2380,13 @@ bool Application::HandleQueueClick(POINT point) {
         } else if ((task.state == DownloadTaskState::Canceled || task.state == DownloadTaskState::Failed) &&
                    PtInRect(&retryButton, point)) {
             handled = m_downloadQueue->Retry(task.id);
+        } else if (task.state == DownloadTaskState::Completed &&
+                   PtInRect(&voiceOverButton, point)) {
+            if (TaskHasVoiceOverVideoPath(task)) {
+                handled = ShowVoiceOverActions(task, voiceOverButton);
+            } else if (TaskCanStartVoiceOverTranslation(task)) {
+                handled = StartTaskVoiceOverTranslation(task);
+            }
         } else if (task.state == DownloadTaskState::Completed &&
                    PtInRect(&transcriptButton, point)) {
             if (TaskHasTranscriptTextPath(task)) {
@@ -2243,6 +2531,7 @@ bool Application::UpdateQueueHover(POINT point) {
             const RECT transcriptButton = QueueTranscriptButtonRect(row);
 
             const DownloadTaskSnapshot& task = tasks[static_cast<size_t>(taskIndex)];
+            const RECT voiceOverButton = QueueVoiceOverButtonRect(row, task);
             if (IsRunningTaskState(task.state) && PtInRect(&primaryButton, point)) {
                 hotTaskId = task.id;
                 hotAction = kQueueActionCancel;
@@ -2250,6 +2539,11 @@ bool Application::UpdateQueueHover(POINT point) {
                        PtInRect(&retryButton, point)) {
                 hotTaskId = task.id;
                 hotAction = kQueueActionRetry;
+            } else if (task.state == DownloadTaskState::Completed &&
+                       (TaskHasVoiceOverVideoPath(task) || TaskCanStartVoiceOverTranslation(task)) &&
+                       PtInRect(&voiceOverButton, point)) {
+                hotTaskId = task.id;
+                hotAction = kQueueActionVoiceOver;
             } else if (task.state == DownloadTaskState::Completed &&
                        (TaskHasTranscriptTextPath(task) || TaskCanStartTranscription(task)) &&
                        PtInRect(&transcriptButton, point)) {
@@ -2421,6 +2715,7 @@ void Application::InitializeBackend() {
     std::filesystem::create_directories(m_paths->stuffDir(), ec);
     std::filesystem::create_directories(m_paths->thumbCacheDir(), ec);
     std::filesystem::create_directories(m_paths->toolsDir(), ec);
+    std::filesystem::create_directories(m_paths->voiceOverTempDir(), ec);
 
     m_logger = std::make_unique<Logger>(*m_paths);
     m_logger->Info(L"Application started: root=" + m_paths->root().wstring());
@@ -2788,10 +3083,15 @@ void Application::EnqueueCurrentUrl() {
             request.whisperExePath = ResolveWhisperExePath(*m_paths, m_config);
             request.whisperModelPath = ResolveWhisperModelPath(*m_paths, m_config);
             request.transcriptionTempDir = m_paths->transcriptionTempDir();
+            request.voiceOverTempDir = m_paths->voiceOverTempDir();
         }
         request.quality = m_config.quality;
         request.container = m_config.container;
         request.whisperLanguage = m_config.whisperLanguage;
+        request.votCliPath = ResolveVotCliPath(m_config);
+        request.voiceOverLanguage = m_config.voiceOverLanguage.empty() ? L"ru" : m_config.voiceOverLanguage;
+        request.voiceOverMode = m_config.voiceOverMode == L"mixed" ? L"mixed" : L"separate";
+        request.originalVolumePercent = std::clamp(m_config.originalVolumePercent, 0, 100);
         request.transcribeAfterDownload = m_config.transcribeAfterDownload;
         return request;
     };

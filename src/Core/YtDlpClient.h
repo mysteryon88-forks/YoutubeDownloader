@@ -20,9 +20,14 @@ struct YtDlpDownloadRequest {
     std::filesystem::path whisperExePath;
     std::filesystem::path whisperModelPath;
     std::filesystem::path transcriptionTempDir;
+    std::filesystem::path votCliPath;
+    std::filesystem::path voiceOverTempDir;
     std::wstring quality = L"max";
     std::wstring container = L"auto";
     std::wstring whisperLanguage = L"auto";
+    std::wstring voiceOverLanguage = L"ru";
+    std::wstring voiceOverMode = L"separate";
+    int originalVolumePercent = 25;
     bool ffmpegAvailable = false;
     bool transcribeAfterDownload = false;
 };

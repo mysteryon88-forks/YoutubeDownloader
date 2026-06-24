@@ -95,3 +95,7 @@ std::filesystem::path AppPaths::localWhisperModelPath() const {
 std::filesystem::path AppPaths::transcriptionTempDir() const {
     return stuffDir() / L"transcription_tmp";
 }
+
+std::filesystem::path AppPaths::voiceOverTempDir() const {
+    return stuffDir() / L"voiceover_tmp";
+}

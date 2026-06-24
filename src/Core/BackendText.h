@@ -11,4 +11,5 @@ std::filesystem::path PathFromUtf8(const std::string& value);
 std::wstring FormatBytes(std::uint64_t bytes);
 std::wstring FormatProgressBytes(std::uint64_t downloaded, std::uint64_t total);
 std::wstring FormatDuration(std::uint64_t seconds);
+std::wstring FormatElapsedDuration(std::uint64_t seconds);
 int CalculateProgressPercent(std::uint64_t downloaded, std::uint64_t total);

@@ -14,6 +14,7 @@
 #include <iterator>
 #include <sstream>
 #include <system_error>
+#include <cwctype>
 #include <windows.h>
 
 namespace {
@@ -71,6 +72,44 @@ std::filesystem::path SearchPathExe(const wchar_t* exeName) {
     }
     buffer.resize(written);
     return std::filesystem::path(buffer);
+}
+
+std::filesystem::path CmdExePath() {
+    wchar_t* comspec = nullptr;
+    size_t comspecLength = 0;
+    if (_wdupenv_s(&comspec, &comspecLength, L"COMSPEC") == 0 && comspec && comspecLength > 0) {
+        std::filesystem::path result = comspec;
+        free(comspec);
+        return result;
+    }
+    free(comspec);
+
+    std::filesystem::path systemCmd = L"C:\\Windows\\System32\\cmd.exe";
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(systemCmd, ec)) {
+        return systemCmd;
+    }
+    return L"cmd.exe";
+}
+
+std::wstring LowerPathExtension(const std::filesystem::path& path) {
+    std::wstring extension = path.extension().wstring();
+    std::transform(extension.begin(), extension.end(), extension.begin(), [](wchar_t ch) {
+        return static_cast<wchar_t>(std::towlower(ch));
+    });
+    return extension;
+}
+
+std::filesystem::path SearchNpmExecutable() {
+    std::filesystem::path npm = SearchPathExe(L"npm.cmd");
+    if (IsExecutableFile(npm)) {
+        return npm;
+    }
+    npm = SearchPathExe(L"npm.exe");
+    if (IsExecutableFile(npm)) {
+        return npm;
+    }
+    return {};
 }
 
 std::wstring ReadTextFile(const std::filesystem::path& path) {
@@ -310,6 +349,27 @@ ReleaseAssetInfo ParseGitHubReleaseAsset(const std::string& releaseJson, const s
     }
 
     return info;
+}
+
+ToolProcessInvocation BuildVotCliInstallInvocation(const std::filesystem::path& npmExecutable) {
+    ToolProcessInvocation invocation;
+    const std::vector<std::wstring> npmArguments = {L"install", L"-g", L"vot-cli"};
+    const std::wstring extension = LowerPathExtension(npmExecutable);
+    if (extension == L".cmd" || extension == L".bat") {
+        invocation.executable = CmdExePath();
+        invocation.arguments = {
+            L"/d",
+            L"/c",
+            L"call",
+            npmExecutable.wstring()
+        };
+        invocation.arguments.insert(invocation.arguments.end(), npmArguments.begin(), npmArguments.end());
+        return invocation;
+    }
+
+    invocation.executable = npmExecutable;
+    invocation.arguments = npmArguments;
+    return invocation;
 }
 
 FfmpegStatus FfmpegManager::Resolve(const AppPaths& paths, const AppConfig& config) {
@@ -783,6 +843,121 @@ std::filesystem::path WhisperManager::DownloadModel(
         throw std::runtime_error("failed to finalize whisper model");
     }
     return target;
+}
+
+VotCliStatus VotCliManager::Resolve(const AppConfig& config) {
+    if (!config.votCliPath.empty()) {
+        VotCliStatus configured = ResolveUserPath(config.votCliPath);
+        if (configured.available || !configured.executable.empty()) {
+            return configured;
+        }
+    }
+
+    VotCliStatus status;
+    status.nodeExecutable = SearchPathExe(L"node.exe");
+    status.nodeAvailable = IsExecutableFile(status.nodeExecutable);
+    status.executable = SearchPathExe(L"vot-cli.cmd");
+    if (status.executable.empty()) {
+        status.executable = SearchPathExe(L"vot-cli.exe");
+    }
+
+    if (!IsExecutableFile(status.executable)) {
+        status.message = L"vot-cli не найден";
+        return status;
+    }
+    if (!status.nodeAvailable) {
+        status.message = L"node.exe не найден";
+        return status;
+    }
+
+    status.available = true;
+    status.message = L"vot-cli найден";
+    return status;
+}
+
+VotCliStatus VotCliManager::ResolveUserPath(const std::filesystem::path& path) {
+    VotCliStatus status;
+    status.nodeExecutable = SearchPathExe(L"node.exe");
+    status.nodeAvailable = IsExecutableFile(status.nodeExecutable);
+
+    if (path.empty()) {
+        status.message = L"Путь vot-cli не задан";
+        return status;
+    }
+
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(path, ec)) {
+        status.executable = path;
+    } else if (std::filesystem::is_directory(path, ec)) {
+        const std::filesystem::path cmd = path / L"vot-cli.cmd";
+        const std::filesystem::path exe = path / L"vot-cli.exe";
+        if (IsExecutableFile(cmd)) {
+            status.executable = cmd;
+        } else if (IsExecutableFile(exe)) {
+            status.executable = exe;
+        }
+    }
+
+    if (!IsExecutableFile(status.executable)) {
+        status.message = L"В выбранном пути не найден vot-cli.cmd";
+        return status;
+    }
+    if (!status.nodeAvailable) {
+        status.message = L"node.exe не найден";
+        return status;
+    }
+
+    status.available = true;
+    status.message = L"vot-cli найден";
+    return status;
+}
+
+VotCliStatus VotCliManager::InstallGlobal(
+    const std::function<void(std::uint64_t downloaded, std::uint64_t total, const std::wstring& status)>& onProgress,
+    HANDLE cancelEvent
+) {
+    const std::filesystem::path npm = SearchNpmExecutable();
+    if (!IsExecutableFile(npm)) {
+        throw std::runtime_error("npm was not found");
+    }
+
+    if (onProgress) {
+        onProgress(0, 0, L"Установка vot-cli через npm...");
+    }
+
+    ProcessRunOptions options;
+    const ToolProcessInvocation invocation = BuildVotCliInstallInvocation(npm);
+    options.executable = invocation.executable;
+    options.arguments = invocation.arguments;
+    options.timeoutMs = INFINITE;
+    options.cancelEvent = cancelEvent;
+    const auto handleLine = [onProgress](const std::wstring& line) {
+        if (onProgress && !line.empty()) {
+            onProgress(0, 0, line);
+        }
+    };
+    options.onStdoutLine = handleLine;
+    options.onStderrLine = handleLine;
+
+    const ProcessRunResult result = ProcessRunner::Run(options);
+    if (result.canceled) {
+        throw std::runtime_error("operation canceled");
+    }
+    if (result.exitCode != 0) {
+        const std::wstring message = result.stderrText.empty() ? result.stdoutText : result.stderrText;
+        const std::string utf8Message = WideToUtf8(message.empty() ? L"npm install -g vot-cli failed" : message);
+        throw std::runtime_error(utf8Message);
+    }
+
+    if (onProgress) {
+        onProgress(0, 0, L"Проверка vot-cli...");
+    }
+
+    VotCliStatus status = Resolve(AppConfig{});
+    if (!status.available) {
+        throw std::runtime_error("vot-cli was installed, but it is not visible in PATH");
+    }
+    return status;
 }
 
 YtDlpManager::YtDlpManager(AppPaths paths)

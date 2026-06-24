@@ -2,6 +2,7 @@
 
 #include "YtDlpClient.h"
 
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <filesystem>
@@ -96,6 +97,7 @@ public:
 private:
     struct TaskRecord {
         DownloadTaskSnapshot snapshot;
+        std::chrono::steady_clock::time_point startedAt{};
         bool cancelRequested = false;
         bool active = false;
         bool postProcessingOnly = false;

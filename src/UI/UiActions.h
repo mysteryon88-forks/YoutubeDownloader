@@ -45,6 +45,10 @@ WhisperUtilityStatusText BuildWhisperUtilityStatusText(
     const std::filesystem::path& modelPath
 );
 std::filesystem::path FindTranscriptTextPath(const std::vector<std::filesystem::path>& outputFiles);
+std::filesystem::path FindVoiceOverVideoPath(
+    const std::vector<std::filesystem::path>& outputFiles,
+    const std::wstring& language
+);
 void PasteReplacingEditText(HWND editControl);
 void CopyTextToClipboard(HWND owner, const std::wstring& text);
 void RestoreModalOwner(HWND owner, bool ownerWasEnabled);

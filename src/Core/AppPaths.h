@@ -29,6 +29,7 @@ public:
     std::filesystem::path localWhisperModelsDir() const;
     std::filesystem::path localWhisperModelPath() const;
     std::filesystem::path transcriptionTempDir() const;
+    std::filesystem::path voiceOverTempDir() const;
 
 private:
     std::filesystem::path m_root;
